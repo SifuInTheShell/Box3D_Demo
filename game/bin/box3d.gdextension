@@ -1,0 +1,16 @@
+[configuration]
+
+entry_symbol = "box3d_library_init"
+compatibility_minimum = "4.7"
+reloadable = true
+
+[libraries]
+
+; Windows + Linux x86_64. For other platforms, build the extension from
+; extern/box3d-godot/godot (scons) and add the entries back — see
+; extern/box3d-godot/godot/demo/bin/box3d.gdextension for the full list.
+windows.debug.x86_64 = "res://bin/libbox3d_godot.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://bin/libbox3d_godot.windows.template_release.x86_64.dll"
+
+linux.debug.x86_64 = "res://bin/libbox3d_godot.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "res://bin/libbox3d_godot.linux.template_release.x86_64.so"

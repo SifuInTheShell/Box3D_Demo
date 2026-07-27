@@ -1,0 +1,50 @@
+# Headless test gate: every suite's exit code is its verdict.
+# Downloads Godot 4.7.1 (Linux headless) at runtime from the official release,
+# so no engine binary is committed. The pure-sim suites run as SceneTree
+# scripts; the city-settles check runs the full physics scene headless.
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  headless:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Godot 4.7.1 (Linux headless)
+        run: |
+          curl -fsSL -o godot.zip \
+            https://github.com/godotengine/godot/releases/download/4.7.1-stable/Godot_v4.7.1-stable_linux.x86_64.zip
+          unzip -q godot.zip
+          chmod +x Godot_v4.7.1-stable_linux.x86_64
+
+      - name: Import resources (first run builds the .godot cache)
+        run: ./Godot_v4.7.1-stable_linux.x86_64 --headless --path game --import
+
+      - name: Pure sim suites
+        run: |
+          set -e
+          for s in systems/fire/fire_sim_test.gd \
+                   systems/glass/glass_sim_test.gd \
+                   systems/wind/wind_sim_test.gd \
+                   systems/ambient/ambient_sim_test.gd \
+                   systems/demolition/demo_math_test.gd \
+                   systems/demolition/structural_integrity_test.gd \
+                   systems/demolition/panel_graph_test.gd \
+                   systems/demolition/brick_lattice_test.gd \
+                   systems/demolition/blast_plan_types_test.gd; do
+            echo "=== $s"
+            timeout 180 ./Godot_v4.7.1-stable_linux.x86_64 --headless -s "$s" --path game
+          done
+
+      - name: City settles
+        run: >
+          timeout 300 ./Godot_v4.7.1-stable_linux.x86_64 --headless
+          --path game res://scenes/test/settle_test.tscn
+
+      - name: Derby brawls
+        run: >
+          timeout 300 ./Godot_v4.7.1-stable_linux.x86_64 --headless --fixed-fps 60
+          --path game res://scenes/test/derby_test.tscn

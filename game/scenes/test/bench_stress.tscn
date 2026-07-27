@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://dcksgnhqk175h"]
+
+[ext_resource type="Script" uid="uid://t5vaid2luxm" path="res://scenes/test/bench_stress.gd" id="1_bench"]
+
+[node name="BenchStress" type="Node3D" unique_id=1358178575]
+script = ExtResource("1_bench")

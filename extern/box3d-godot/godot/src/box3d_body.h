@@ -1,0 +1,346 @@
+// SPDX-FileCopyrightText: 2026 box3d-godot contributors
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+#include <godot_cpp/classes/mesh.hpp>
+#include <godot_cpp/classes/node3d.hpp>
+#include <godot_cpp/variant/aabb.hpp>
+
+#include <box3d/box3d.h>
+
+#include <vector>
+
+namespace godot {
+
+class Box3DWorld;
+class Box3DCollisionShape;
+class MeshInstance3D;
+
+// A rigid body simulated by the nearest Box3DWorld ancestor. The node's
+// transform is driven by the simulation for dynamic bodies, and drives the
+// simulation for kinematic bodies. Attach a MeshInstance3D child for visuals.
+class Box3DBody : public Node3D {
+	GDCLASS(Box3DBody, Node3D)
+
+public:
+	enum BodyType {
+		STATIC = 0,
+		KINEMATIC = 1,
+		DYNAMIC = 2,
+	};
+
+	enum ShapeType {
+		BOX = 0,
+		SPHERE = 1,
+		CAPSULE = 2,
+		CYLINDER = 3,
+		CONE = 4,
+		HULL = 5,
+		MESH = 6,
+		FIT_MESH = 7, // box collider auto-sized to the child MeshInstance3D's bounds
+	};
+
+private:
+	b3BodyId body_id = b3_nullBodyId;
+	// A triangle-mesh shape references this data (Box3D does not copy it), so it
+	// must outlive the shape; freed in destroy_body().
+	b3MeshData *mesh_data = nullptr;
+	Box3DWorld *world = nullptr;
+
+	BodyType body_type = DYNAMIC;
+	ShapeType shape_type = BOX;
+	// True once the node transform was synced after the body fell asleep, so
+	// sleeping bodies cost nothing in the per-step sync loop.
+	bool asleep_synced = false;
+	// When false, sync_from_physics still records the render snapshots but
+	// leaves the Godot node transform alone. Box3DMultiMeshRenderer turns
+	// this off for its bodies: at tens of thousands of nodes, per-tick
+	// set_global_transform plus the engine's own per-frame interpolation
+	// bookkeeping costs more than the solver. Scripts reading such a body's
+	// node position see its spawn pose.
+	bool sync_node_transform = true;
+	b3WorldTransform snap_prev = {}; // last two tick transforms, for render
+	b3WorldTransform snap_curr = {}; // interpolation without node reads
+	// Solver state mirrored at the last sync, so the world's debug draw can
+	// read 16k bodies per refresh without one b3 lookup per field per body.
+	bool snap_awake = false; // b3Body_IsAwake at the last sync_from_physics
+	float debug_mass = 0.0f; // b3Body_GetMass, cached at (re)creation
+	// b3Body_IsEnabled, cached at (re)creation. The binding exposes no way to
+	// disable a body, so this cannot go stale; if an enable/disable API is ever
+	// added, its setter must update this flag.
+	bool debug_enabled = true;
+	// Shape topology mirrors, cached at (re)creation: reading them live means
+	// get_child_count()/get_child() engine calls through the extension
+	// boundary for every body every refresh. Any shape change (own setters or
+	// a child Box3DCollisionShape's request_rebuild) recreates the body and
+	// recomputes these.
+	bool debug_has_child_shapes = false;
+	float debug_min_ext = 0.5f;
+	float debug_max_ext = 0.5f;
+	Vector3 box_size = Vector3(1, 1, 1); // full extents
+	double sphere_radius = 0.5;
+	double capsule_radius = 0.5;
+	double capsule_height = 2.0; // total height, including the two caps
+	// Cylinder and cone reuse capsule_radius / capsule_height. Sides sets their
+	// tessellation (they are built as convex hulls).
+	int cylinder_sides = 16;
+	Ref<Mesh> collision_mesh; // convex hull is built from this mesh's vertices
+	double density = 1.0;
+	double friction = 0.6;
+	double restitution = 0.0;
+	double linear_damping = 0.0;
+	double angular_damping = 0.05;
+	double gravity_scale = 1.0;
+	bool contact_monitor = false;
+	bool is_sensor = false;
+	bool debug_visualize = true; // false = no shell in the world's debug draw
+	int debug_hit_frames = 0; // >0: recent hit event, debug draw flashes lime
+	bool continuous = false; // continuous collision (bullet)
+	// Upstream stabilizer for big stacks: matching contacts are reused between
+	// steps while a pair barely moves, keeping warm-start impulses intact.
+	bool contact_recycling = true; // mirrors b3BodyDef.enableContactRecycling
+	bool allow_fast_rotation = false;
+	bool lock_linear_x = false;
+	bool lock_linear_y = false;
+	bool lock_linear_z = false;
+	bool lock_angular_x = false;
+	bool lock_angular_y = false;
+	bool lock_angular_z = false;
+	uint32_t collision_layer = 1;
+	uint32_t collision_mask = 0xFFFFFFFFu;
+	// When true and no MeshInstance3D child is present, a MeshInstance3D is
+	// generated at runtime whose mesh mirrors the collision shape (box/sphere/
+	// capsule/cylinder/cone), so box_size/sphere_radius/etc. drive both the
+	// collider and the visual from one place. Default false for backward
+	// compatibility with existing scenes.
+	bool auto_visual = false;
+	// The node auto_visual generates; nullptr when there is none (auto_visual
+	// is off, or the body already has its own MeshInstance3D child).
+	MeshInstance3D *auto_mesh_instance = nullptr;
+
+	Box3DWorld *find_world();
+	// b3Body_IsValid plus a join of any in-flight async world step.
+	bool body_live() const;
+	void rebuild_if_alive();
+	void apply_motion_locks();
+	void create_child_shape(Box3DCollisionShape *p_shape, const Transform3D &p_body_inv);
+	// Mesh used for Hull/Mesh/FitMesh colliders: an explicit collision_mesh (at
+	// identity), else the first child MeshInstance3D's mesh (at its local
+	// transform). Returns false if neither is available.
+	bool resolve_collision_mesh(Ref<Mesh> &r_mesh, Transform3D &r_local);
+	// Creates/updates/removes auto_mesh_instance to match auto_visual and the
+	// current shape_type/size. No-op in the editor (runtime feature only).
+	void update_auto_visual();
+
+protected:
+	static void _bind_methods();
+	void _notification(int p_what);
+
+public:
+	Box3DBody();
+	~Box3DBody();
+
+	// Internal, called by the owning world / node lifecycle.
+	void create_in_world();
+	void destroy_body();
+	void request_rebuild(); // called by child Box3DCollisionShape nodes
+	void sync_to_physics(double p_delta);
+	void sync_from_physics();
+	bool is_body_valid() const;
+	// Live solver state, for the world's state-colored debug draw.
+	bool is_awake_now() const;
+	bool is_enabled_now() const;
+	float debug_min_extent() const;
+	float debug_max_extent() const;
+	// Hit-event flash: the world marks qualifying impacts, the debug draw
+	// shows them lime, upstream's "had time of impact" look. Upstream's flag
+	// lasts exactly one step; two frames keeps the flash visible at 60 Hz.
+	void debug_hit_mark() { debug_hit_frames = 2; }
+	void debug_hit_decay() {
+		if (debug_hit_frames > 0) {
+			--debug_hit_frames;
+		}
+	}
+	bool debug_hit_active() const { return debug_hit_frames > 0; }
+	b3BodyId get_body_id() const { return body_id; }
+	// Previous/current tick transforms, kept by sync_from_physics for
+	// Box3DMultiMeshRenderer to interpolate between at render rate.
+	void get_render_snapshots(b3WorldTransform &r_prev, b3WorldTransform &r_curr) const {
+		r_prev = snap_prev;
+		r_curr = snap_curr;
+	}
+	// Cached solver state for the debug draw's per-refresh scan (no b3 calls).
+	// snap_awake is only maintained for DYNAMIC bodies (sync_from_physics skips
+	// the rest); the debug draw queries b3 directly for kinematic bodies.
+	bool get_snap_awake() const { return snap_awake; }
+	const b3WorldTransform &get_snap_curr() const { return snap_curr; }
+	const b3WorldTransform &get_snap_prev() const { return snap_prev; }
+	float get_cached_mass() const { return debug_mass; }
+	bool get_cached_enabled() const { return debug_enabled; }
+	bool has_cached_child_shapes() const { return debug_has_child_shapes; }
+	float get_cached_min_extent() const { return debug_min_ext; }
+	float get_cached_max_extent() const { return debug_max_ext; }
+
+	// Called by the world when it dispatches contact / sensor events.
+	void emit_contact_begin(Box3DBody *p_other);
+	void emit_contact_end(Box3DBody *p_other);
+	void emit_hit(Box3DBody *p_other, const Vector3 &p_point,
+			const Vector3 &p_normal, float p_approach_speed);
+	void emit_area_begin(Box3DBody *p_visitor);
+	void emit_area_end(Box3DBody *p_visitor);
+
+	// Scripting API.
+	void apply_central_force(const Vector3 &p_force);
+	void apply_central_impulse(const Vector3 &p_impulse);
+	void apply_torque(const Vector3 &p_torque);
+	void set_linear_velocity(const Vector3 &p_velocity);
+	Vector3 get_linear_velocity() const;
+	void set_angular_velocity(const Vector3 &p_velocity);
+	Vector3 get_angular_velocity() const;
+	double get_mass() const;
+	void teleport(const Transform3D &p_xform);
+
+	// Properties.
+	void set_body_type(int p_type);
+	int get_body_type() const;
+	void set_shape_type(int p_type);
+	int get_shape_type() const;
+	void set_box_size(const Vector3 &p_size);
+	Vector3 get_box_size() const;
+	void set_sphere_radius(double p_radius);
+	double get_sphere_radius() const;
+	void set_capsule_radius(double p_radius);
+	double get_capsule_radius() const;
+	void set_capsule_height(double p_height);
+	double get_capsule_height() const;
+	void set_cylinder_sides(int p_sides);
+	int get_cylinder_sides() const;
+	void set_collision_mesh(const Ref<Mesh> &p_mesh);
+	Ref<Mesh> get_collision_mesh() const;
+	void set_density(double p_density);
+	double get_density() const;
+	void set_friction(double p_friction);
+	double get_friction() const;
+	void set_restitution(double p_restitution);
+	double get_restitution() const;
+	void set_linear_damping(double p_damping);
+	double get_linear_damping() const;
+	void set_angular_damping(double p_damping);
+	double get_angular_damping() const;
+	void set_gravity_scale(double p_scale);
+	double get_gravity_scale() const;
+	void set_contact_monitor(bool p_enabled);
+	bool get_contact_monitor() const;
+	void set_is_sensor(bool p_sensor);
+	bool get_is_sensor() const;
+	void set_debug_visualize(bool p_enabled);
+	bool get_debug_visualize() const;
+	void set_continuous(bool p_enabled);
+	bool get_continuous() const;
+	void set_contact_recycling(bool p_enabled);
+	bool get_contact_recycling() const;
+	void set_sync_node_transform(bool p_enabled);
+	bool get_sync_node_transform() const;
+	void set_allow_fast_rotation(bool p_enabled);
+	bool get_allow_fast_rotation() const;
+	void set_lock_linear_x(bool p_v);
+	bool get_lock_linear_x() const;
+	void set_lock_linear_y(bool p_v);
+	bool get_lock_linear_y() const;
+	void set_lock_linear_z(bool p_v);
+	bool get_lock_linear_z() const;
+	void set_lock_angular_x(bool p_v);
+	bool get_lock_angular_x() const;
+	void set_lock_angular_y(bool p_v);
+	bool get_lock_angular_y() const;
+	void set_lock_angular_z(bool p_v);
+	bool get_lock_angular_z() const;
+	void set_collision_layer(int p_layer);
+	int get_collision_layer() const;
+	void set_collision_mask(int p_mask);
+	int get_collision_mask() const;
+	void set_auto_visual(bool p_enabled);
+	bool get_auto_visual() const;
+
+	// --- Extended core access -------------------------------------------------
+	void apply_force(const Vector3 &p_force, const Vector3 &p_world_point);
+	void apply_impulse(const Vector3 &p_impulse, const Vector3 &p_world_point);
+	void apply_angular_impulse(const Vector3 &p_impulse);
+	Vector3 get_point_velocity(const Vector3 &p_world_point) const;
+	Vector3 get_center_of_mass() const;
+	double get_inverse_mass() const;
+	Dictionary get_mass_data() const;
+	void set_mass_data(double p_mass, const Vector3 &p_local_center);
+	void reset_mass();
+	void set_sleep_threshold(double p_speed);
+	double get_sleep_threshold() const;
+	void set_enabled(bool p_enabled);
+	bool is_enabled() const;
+	void wake();
+	bool is_awake() const;
+	Dictionary get_closest_point(const Vector3 &p_target) const;
+	Array get_contact_data() const;
+
+	// --- Extended core access II: transforms, introspection, live shapes ------
+	// Point/vector transforms between this body's local frame and world space.
+	// Points are affected by the body's position; vectors only by its rotation.
+	Vector3 to_local_point(const Vector3 &p_world_point) const;
+	Vector3 to_world_point(const Vector3 &p_local_point) const;
+	Vector3 to_local_vector(const Vector3 &p_world_vector) const;
+	Vector3 to_world_vector(const Vector3 &p_local_vector) const;
+	// World-frame velocity of a point given in this body's local frame
+	// (get_point_velocity above takes the point in world space instead).
+	Vector3 get_local_point_velocity(const Vector3 &p_local_point) const;
+	// Centre of mass expressed in the body's local frame.
+	Vector3 get_local_center() const;
+	// Tight world-space AABB enclosing all of the body's shapes.
+	AABB get_aabb() const;
+	int get_shape_count() const;
+	int get_joint_count() const;
+
+	// Live per-shape access. Setters apply to every shape on the body; getters
+	// read the shape at shape_index (0 = first, the common single-shape case),
+	// returning a neutral default when the index is out of range. These change
+	// the running simulation directly, without rebuilding the body.
+	void set_shape_friction(double p_friction);
+	double get_shape_friction(int p_shape_index = 0) const;
+	void set_shape_restitution(double p_restitution);
+	double get_shape_restitution(int p_shape_index = 0) const;
+	void set_shape_density(double p_density, bool p_update_mass = true);
+	double get_shape_density(int p_shape_index = 0) const;
+	// Collision filter bits/group. get returns { category, mask, group }.
+	void set_shape_filter(int p_category, int p_mask, int p_group = 0);
+	Dictionary get_shape_filter(int p_shape_index = 0) const;
+	// Full surface material. Dictionary keys: friction, restitution,
+	// rolling_resistance, tangent_velocity (Vector3), user_material_id,
+	// custom_color. Missing keys keep the shape's current value.
+	void set_shape_surface_material(const Dictionary &p_material);
+	Dictionary get_shape_surface_material(int p_shape_index = 0) const;
+	void enable_shape_contact_events(bool p_enabled);
+	bool are_shape_contact_events_enabled(int p_shape_index = 0) const;
+	void enable_shape_hit_events(bool p_enabled);
+	bool are_shape_hit_events_enabled(int p_shape_index = 0) const;
+	void enable_shape_sensor_events(bool p_enabled);
+	bool are_shape_sensor_events_enabled(int p_shape_index = 0) const;
+	void enable_shape_presolve_events(bool p_enabled);
+	bool are_shape_presolve_events_enabled(int p_shape_index = 0) const;
+	bool is_shape_sensor(int p_shape_index = 0) const;
+	// The core b3ShapeType of the live shape (sphere/capsule/hull/mesh/height/
+	// compound), distinct from the body's own ShapeType authoring enum.
+	int get_shape_core_type(int p_shape_index = 0) const;
+	AABB get_shape_aabb(int p_shape_index = 0) const;
+	// Closest point on the shape to a world-space target: { distance, point }.
+	Dictionary get_shape_closest_point(const Vector3 &p_target, int p_shape_index = 0) const;
+	// Ray vs. a single shape: { hit, position, normal, fraction }.
+	Dictionary shape_raycast(const Vector3 &p_from, const Vector3 &p_to, int p_shape_index = 0) const;
+
+private:
+	// The body's live shape ids (empty when the body is not in the world).
+	std::vector<b3ShapeId> shape_ids() const;
+};
+
+} // namespace godot
+
+VARIANT_ENUM_CAST(godot::Box3DBody::BodyType);
+VARIANT_ENUM_CAST(godot::Box3DBody::ShapeType);

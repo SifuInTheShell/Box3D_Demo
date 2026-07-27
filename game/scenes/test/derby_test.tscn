@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://cd3rbyt3stb0t"]
+
+[ext_resource type="Script" path="res://scenes/test/derby_test.gd" id="1_derbytest"]
+
+[node name="DerbyTest" type="Node3D"]
+script = ExtResource("1_derbytest")

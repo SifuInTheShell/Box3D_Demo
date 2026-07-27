@@ -1,0 +1,30 @@
+# Godot editor binaries — NOT shipped (download 4.7.1 from godotengine.org).
+# Kept out of the repo to avoid the LFS clone-traffic cost.
+/Godot_v4.7.1-stable_win64.exe
+/Godot_v4.7.1-stable_linux.x86_64
+
+# Godot editor cache
+game/.godot/
+# Windows file-lock copies of the GDExtension DLL (created while the editor runs)
+game/bin/~*.dll
+__pycache__/
+
+# Intermediate asset sources (raw downloads; decimated/used versions are committed)
+/game/lib/fx/models/realistic/
+/tools/asset_work/
+
+# Local dev tooling — not redistributable / machine-specific.
+# "Godot MCP Pro" is a third-party premium plugin with no redistribution
+# license; keep your local copy, it must not ship in the public repo.
+game/addons/godot_mcp/
+.mcp.json
+
+# Editor & Python environment cruft
+.vscode/
+.idea/
+venv/
+.venv/
+*.pyc
+
+# Local working note — scratch, not part of the public demo.
+DEMO_SYNC.md

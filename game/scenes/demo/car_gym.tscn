@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://cw4r6ymn0p3qa"]
+
+[ext_resource type="Script" path="res://scenes/demo/car_gym.gd" id="1_cargym"]
+
+[node name="CarGym" type="Node3D"]
+script = ExtResource("1_cargym")

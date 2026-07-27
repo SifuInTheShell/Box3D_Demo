@@ -1,0 +1,7 @@
+# mode=cpu+gpu cpu=13th Gen Intel(R) Core(TM) i5-1335U cores=12 workers=4 gpu=Intel(R) UHD Graphics (integrated) godot=4.7.1-stable (official) timer=extended
+bodies,awake,contacts,step_avg_ms,step_max_ms,fps_avg,fps_min
+2000,2000,2000,2.710,7.640,148.2,104.0
+4000,4000,4000,8.401,13.802,140.1,88.0
+8000,8000,9292,14.665,25.637,64.5,61.0
+16000,16000,33055,24.935,35.869,14.8,4.0
+24000,24000,50560,41.210,70.436,5.2,2.0

@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://bai66k45xp7h3"]
+
+[ext_resource type="Script" uid="uid://ka5i324gukb3" path="res://scenes/demo/city_gym.gd" id="1_113m0"]
+
+[node name="CityGym" type="Node3D" unique_id=1563324310]
+script = ExtResource("1_113m0")
