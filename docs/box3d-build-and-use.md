@@ -10,7 +10,7 @@ internally and why our tuning choices follow from it).
 
 | Repo | What it is | Our pin |
 |---|---|---|
-| [erincatto/box3d](https://github.com/erincatto/box3d) | Upstream: Catto's 3D rigid-body engine (C17, v0.1.x, the 3D successor to Box2D v3) | via the fork below |
+| [erincatto/box3d](https://github.com/erincatto/box3d) | Upstream: Catto's 3D rigid-body engine (C17, v0.1.x, the 3D successor to Box2D v3) | `be8c731` (synced directly; see `extern/box3d-godot/UPSTREAM_COMMIT`) |
 | [Stink-O/box3d-godot](https://github.com/Stink-O/box3d-godot) | Fork of upstream with a Godot 4.7 GDExtension in `godot/`. Upstream sources are **unchanged**; everything Godot-specific lives in that one folder, so the fork syncs cleanly | `a42bed6` |
 | [godotengine/godot-cpp](https://github.com/godotengine/godot-cpp) | The GDExtension C++ bindings, normally a submodule of `godot/` | `ba0edfed90512ec64aba51d4295a3e7e30112f86` |
 

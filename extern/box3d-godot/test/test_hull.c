@@ -4,10 +4,12 @@
 #include "test_macros.h"
 
 #include "box3d/collision.h"
+#include "box3d/constants.h"
 #include "box3d/math_functions.h"
 
 #include <float.h>
 #include <math.h>
+#include <stdbool.h>
 #include <string.h>
 
 static const b3Vec3 s_cubeCorners[8] = {
@@ -409,6 +411,107 @@ static int CreateHullMergeChurnStressTest( void )
 	return 0;
 }
 
+// b3ComputeCosSin is a coarse approximation, so build rotations from libm to keep the
+// analytic corner and plane positions exact.
+static b3Quat ExactQuat( b3Vec3 axis, float radians )
+{
+	float half = 0.5f * radians;
+	float s = sinf( half );
+	return (b3Quat){ { s * axis.x, s * axis.y, s * axis.z }, cosf( half ) };
+}
+
+// Corner sign pattern baked by b3MakeTransformedBoxHull, in order.
+static const b3Vec3 s_boxCornerSigns[8] = {
+	{ 1.0f, 1.0f, 1.0f },  { -1.0f, 1.0f, 1.0f },	{ -1.0f, -1.0f, 1.0f },	 { 1.0f, -1.0f, 1.0f },
+	{ 1.0f, 1.0f, -1.0f }, { -1.0f, 1.0f, -1.0f },	{ -1.0f, -1.0f, -1.0f }, { 1.0f, -1.0f, -1.0f },
+};
+
+// The baked box hull is only exercised elsewhere through mass properties, which are analytic
+// and never read boxPoints or boxPlanes. Pin the geometry itself against the transform so an
+// axis swap in the point or plane bake cannot pass silently.
+static int CheckTransformedBox( b3Vec3 h, b3Transform xf )
+{
+	b3BoxHull box = b3MakeTransformedBoxHull( h.x, h.y, h.z, xf );
+
+	const float tol = 1e-5f;
+
+	// Each corner is the transform of the signed half extent.
+	for ( int i = 0; i < 8; ++i )
+	{
+		b3Vec3 local = { s_boxCornerSigns[i].x * h.x, s_boxCornerSigns[i].y * h.y, s_boxCornerSigns[i].z * h.z };
+		b3Vec3 expected = b3TransformPoint( xf, local );
+		ENSURE_SMALL( box.boxPoints[i].x - expected.x, tol );
+		ENSURE_SMALL( box.boxPoints[i].y - expected.y, tol );
+		ENSURE_SMALL( box.boxPoints[i].z - expected.z, tol );
+	}
+
+	// Face normals rotate with the box, offsets carry the rotated normal through the translation.
+	b3Vec3 localNormals[6] = {
+		b3Neg( b3Vec3_axisX ), b3Vec3_axisX, b3Neg( b3Vec3_axisY ), b3Vec3_axisY, b3Neg( b3Vec3_axisZ ), b3Vec3_axisZ,
+	};
+	float localOffsets[6] = { h.x, h.x, h.y, h.y, h.z, h.z };
+	for ( int i = 0; i < 6; ++i )
+	{
+		b3Vec3 n = b3RotateVector( xf.q, localNormals[i] );
+		float offset = localOffsets[i] + b3Dot( n, xf.p );
+		ENSURE_SMALL( box.boxPlanes[i].normal.x - n.x, tol );
+		ENSURE_SMALL( box.boxPlanes[i].normal.y - n.y, tol );
+		ENSURE_SMALL( box.boxPlanes[i].normal.z - n.z, tol );
+		ENSURE_SMALL( box.boxPlanes[i].offset - offset, tol );
+	}
+
+	// SoA vertex mirrors match the AoS points on all eight lanes.
+	for ( int i = 0; i < 8; ++i )
+	{
+		ENSURE_SMALL( box.vx[i] - box.boxPoints[i].x, tol );
+		ENSURE_SMALL( box.vy[i] - box.boxPoints[i].y, tol );
+		ENSURE_SMALL( box.vz[i] - box.boxPoints[i].z, tol );
+	}
+
+	// SoA normal mirrors carry the six real faces and zero the two pad lanes.
+	for ( int i = 0; i < 6; ++i )
+	{
+		ENSURE_SMALL( box.nx[i] - box.boxPlanes[i].normal.x, tol );
+		ENSURE_SMALL( box.ny[i] - box.boxPlanes[i].normal.y, tol );
+		ENSURE_SMALL( box.nz[i] - box.boxPlanes[i].normal.z, tol );
+	}
+	ENSURE( box.nx[6] == 0.0f && box.nx[7] == 0.0f );
+	ENSURE( box.ny[6] == 0.0f && box.ny[7] == 0.0f );
+	ENSURE( box.nz[6] == 0.0f && box.nz[7] == 0.0f );
+
+	// The stored AABB bounds every baked corner.
+	b3AABB pointBox = b3MakeAABB( box.boxPoints, 8, 0.0f );
+	ENSURE( b3AABB_Contains( box.base.aabb, pointBox ) );
+
+	return 0;
+}
+
+static int TransformedBoxHullTest( void )
+{
+	b3Vec3 h = { 0.25f, 0.5f, 0.3f };
+
+	// Identity.
+	if ( CheckTransformedBox( h, b3Transform_identity ) )
+		return 1;
+
+	// Translation only.
+	b3Transform translated = { { 0.4f, -0.7f, 0.1f }, b3Quat_identity };
+	if ( CheckTransformedBox( h, translated ) )
+		return 1;
+
+	// Rotation only. A quarter turn about Y swaps the world X and Z extents.
+	b3Transform rotated = { b3Vec3_zero, ExactQuat( b3Vec3_axisY, 0.25f * B3_PI ) };
+	if ( CheckTransformedBox( h, rotated ) )
+		return 1;
+
+	// Translation and rotation together.
+	b3Transform transformed = { { 3.0f, -2.0f, 1.5f }, ExactQuat( b3Vec3_axisZ, 0.25f * B3_PI ) };
+	if ( CheckTransformedBox( h, transformed ) )
+		return 1;
+
+	return 0;
+}
+
 static int CreateHullDegenerateTest( void )
 {
 	// Real (non-null) buffer; pointCount < 4 cases are guarded inside Construct().
@@ -443,6 +546,338 @@ static int CreateHullDegenerateTest( void )
 	return 0;
 }
 
+static void FillPoints2D( b3Point2D* pts, const b3Vec2* input, int count )
+{
+	for ( int i = 0; i < count; ++i )
+	{
+		pts[i].p = input[i];
+		pts[i].separation = 0.0f;
+		pts[i].originalIndex = i;
+	}
+}
+
+static float Hull2DArea( const b3Point2D* hull, int count )
+{
+	float sum = 0.0f;
+	for ( int i = 0; i < count; ++i )
+	{
+		int next = ( i + 1 ) % count;
+		sum += hull[i].p.x * hull[next].p.y - hull[i].p.y * hull[next].p.x;
+	}
+
+	return 0.5f * sum;
+}
+
+// Interior points contribute no area, so they must not survive the hull.
+static int Hull2DSquareTest( void )
+{
+	b3Vec2 input[8] = {
+		{ -1.0f, -1.0f }, { 1.0f, -1.0f }, { 1.0f, 1.0f },	{ -1.0f, 1.0f },
+		{ 0.0f, 0.0f },	  { 0.5f, 0.25f }, { -0.3f, 0.6f }, { 0.1f, -0.4f },
+	};
+
+	b3Point2D pts[8];
+	b3Point2D hull[16];
+	FillPoints2D( pts, input, 8 );
+
+	int count = b3Hull2D( pts, 8, hull, 0 );
+	ENSURE( count == 4 );
+
+	// The reduction code assumes counter clockwise winding
+	ENSURE( Hull2DArea( hull, count ) > 0.0f );
+
+	bool onHull[8] = { false };
+	for ( int i = 0; i < count; ++i )
+	{
+		ENSURE( 0 <= hull[i].originalIndex && hull[i].originalIndex < 8 );
+		onHull[hull[i].originalIndex] = true;
+	}
+
+	for ( int i = 0; i < 4; ++i )
+	{
+		ENSURE( onHull[i] == true );
+	}
+
+	for ( int i = 4; i < 8; ++i )
+	{
+		ENSURE( onHull[i] == false );
+	}
+
+	return 0;
+}
+
+static int Hull2DCollinearTest( void )
+{
+	b3Vec2 input[5] = {
+		{ 0.0f, 0.0f }, { 1.0f, 0.0f }, { 2.0f, 0.0f }, { 3.0f, 0.0f }, { 4.0f, 0.0f },
+	};
+
+	b3Point2D pts[5];
+	b3Point2D hull[10];
+	FillPoints2D( pts, input, 5 );
+
+	ENSURE( b3Hull2D( pts, 5, hull, 0 ) == 2 );
+
+	return 0;
+}
+
+// Coincident points weld and the lower input index wins, so a sort order change cannot
+// swap which of the two survives.
+static int Hull2DWeldTest( void )
+{
+	float offset = 0.1f * B3_LINEAR_SLOP;
+
+	b3Vec2 input[5] = {
+		{ -1.0f, -1.0f }, { 1.0f, -1.0f }, { 1.0f, 1.0f }, { -1.0f, 1.0f }, { -1.0f + offset, -1.0f + offset },
+	};
+
+	b3Point2D pts[5];
+	b3Point2D hull[10];
+	FillPoints2D( pts, input, 5 );
+
+	int count = b3Hull2D( pts, 5, hull, 0 );
+	ENSURE( count == 4 );
+
+	for ( int i = 0; i < count; ++i )
+	{
+		ENSURE( hull[i].originalIndex != 4 );
+	}
+
+	return 0;
+}
+
+static int SimplifyHull2DTargetTest( void )
+{
+	b3Point2D pts[20];
+	b3Point2D hull[40];
+
+	for ( int i = 0; i < 20; ++i )
+	{
+		float angle = 2.0f * B3_PI * (float)i / 20.0f;
+		pts[i].p = (b3Vec2){ cosf( angle ), sinf( angle ) };
+		pts[i].separation = 0.0f;
+		pts[i].originalIndex = i;
+	}
+
+	int hullCount = b3Hull2D( pts, 20, hull, 0 );
+	ENSURE( hullCount == 20 );
+
+	int count = b3SimplifyHull2D( hull, hullCount, 6 );
+	ENSURE( count == 6 );
+	ENSURE( Hull2DArea( hull, count ) > 0.0f );
+
+	return 0;
+}
+
+static int SimplifyHull2DNoopTest( void )
+{
+	b3Vec2 input[4] = {
+		{ -1.0f, -1.0f },
+		{ 1.0f, -1.0f },
+		{ 1.0f, 1.0f },
+		{ -1.0f, 1.0f },
+	};
+
+	b3Point2D pts[4];
+	b3Point2D hull[8];
+	FillPoints2D( pts, input, 4 );
+
+	int hullCount = b3Hull2D( pts, 4, hull, 0 );
+	ENSURE( hullCount == 4 );
+
+	ENSURE( b3SimplifyHull2D( hull, hullCount, 8 ) == 4 );
+	ENSURE( b3SimplifyHull2D( hull, hullCount, 4 ) == 4 );
+
+	return 0;
+}
+
+// The surviving point set must not depend on the order the points arrive in. The reduction
+// runs inside the solver, so an input order dependence would show up as a determinism bug.
+static int Hull2DOrderTest( void )
+{
+	b3Vec2 input[8] = {
+		{ -2.0f, -1.0f }, { 0.0f, -1.5f }, { 2.0f, -1.0f }, { 2.5f, 0.5f },
+		{ 1.0f, 2.0f },	  { -1.0f, 1.8f }, { -2.5f, 0.4f }, { 0.2f, 0.1f },
+	};
+
+	int permutation[8] = { 5, 2, 7, 0, 4, 6, 1, 3 };
+
+	b3Point2D pts[8];
+	b3Point2D hull[16];
+	FillPoints2D( pts, input, 8 );
+
+	int count1 = b3Hull2D( pts, 8, hull, 0 );
+	ENSURE( count1 == 7 );
+
+	bool onHull1[8] = { false };
+	for ( int i = 0; i < count1; ++i )
+	{
+		onHull1[hull[i].originalIndex] = true;
+	}
+
+	b3Point2D shuffled[8];
+	b3Point2D shuffledHull[16];
+	for ( int i = 0; i < 8; ++i )
+	{
+		shuffled[i].p = input[permutation[i]];
+		shuffled[i].separation = 0.0f;
+		shuffled[i].originalIndex = i;
+	}
+
+	int count2 = b3Hull2D( shuffled, 8, shuffledHull, 0 );
+	ENSURE( count2 == count1 );
+
+	bool onHull2[8] = { false };
+	for ( int i = 0; i < count2; ++i )
+	{
+		onHull2[permutation[shuffledHull[i].originalIndex]] = true;
+	}
+
+	for ( int i = 0; i < 8; ++i )
+	{
+		ENSURE( onHull1[i] == onHull2[i] );
+	}
+
+	return 0;
+}
+
+// Float rounding can call the middle of three nearly collinear points a left turn in both chains.
+// Listing it twice gave the mesh manifold a duplicate point.
+static int Hull2DNearCollinearTest( void )
+{
+	b3Vec2 input[3] = {
+		{ 0.42742428183555603f, -0.9914372563362122f },
+		{ 0.8582707643508911f, -0.7915351390838623f },
+		{ 1.5856003761291504f, -0.45407217741012573f },
+	};
+
+	b3Point2D pts[3];
+	b3Point2D hull[6];
+	FillPoints2D( pts, input, 3 );
+
+	int count = b3Hull2D( pts, 3, hull, 0 );
+	ENSURE( 2 <= count && count <= 3 );
+
+	for ( int i = 0; i < count; ++i )
+	{
+		for ( int j = i + 1; j < count; ++j )
+		{
+			ENSURE( hull[i].originalIndex != hull[j].originalIndex );
+		}
+	}
+
+	return 0;
+}
+
+// A 3 by 3 grid has three points on each side. Only the corners are strict hull vertices.
+static int Hull2DKeepCollinearTest( void )
+{
+	b3Vec2 input[9];
+	for ( int i = 0; i < 9; ++i )
+	{
+		input[i] = (b3Vec2){ (float)( i % 3 ), (float)( i / 3 ) };
+	}
+
+	b3Point2D pts[9];
+	b3Point2D hull[18];
+	FillPoints2D( pts, input, 9 );
+	ENSURE( b3Hull2D( pts, 9, hull, 0 ) == 4 );
+
+	FillPoints2D( pts, input, 9 );
+	int count = b3Hull2D( pts, 9, hull, b3_hull2DKeepCollinear );
+	ENSURE( count == 8 );
+	ENSURE( Hull2DArea( hull, count ) > 0.0f );
+
+	for ( int i = 0; i < count; ++i )
+	{
+		ENSURE( hull[i].originalIndex != 4 );
+	}
+
+	// All collinear keeps every point
+	b3Vec2 line[4] = { { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 2.0f, 0.0f }, { 3.0f, 0.0f } };
+	FillPoints2D( pts, line, 4 );
+	ENSURE( b3Hull2D( pts, 4, hull, b3_hull2DKeepCollinear ) == 4 );
+
+	return 0;
+}
+
+// Coincident points under the exact merge: the earlier point survives unless a later one is deeper by
+// more than the linear slop. The default weld always keeps the earlier point.
+static int Hull2DExactMergeTest( void )
+{
+	b3Vec2 input[5] = {
+		{ -1.0f, -1.0f }, { 1.0f, -1.0f }, { 1.0f, 1.0f }, { -1.0f, 1.0f }, { -1.0f, -1.0f },
+	};
+
+	float depths[2] = { 2.0f * B3_LINEAR_SLOP, 0.5f * B3_LINEAR_SLOP };
+	int expected[2] = { 4, 0 };
+
+	for ( int k = 0; k < 2; ++k )
+	{
+		b3Point2D pts[5];
+		b3Point2D hull[10];
+		FillPoints2D( pts, input, 5 );
+		pts[4].separation = -depths[k];
+
+		int count = b3Hull2D( pts, 5, hull, b3_hull2DExactMerge );
+		ENSURE( count == 4 );
+
+		int survivor = -1;
+		for ( int i = 0; i < count; ++i )
+		{
+			if ( hull[i].originalIndex == 0 || hull[i].originalIndex == 4 )
+			{
+				survivor = hull[i].originalIndex;
+			}
+		}
+		ENSURE( survivor == expected[k] );
+
+		FillPoints2D( pts, input, 5 );
+		pts[4].separation = -depths[k];
+		count = b3Hull2D( pts, 5, hull, 0 );
+		ENSURE( count == 4 );
+
+		for ( int i = 0; i < count; ++i )
+		{
+			ENSURE( hull[i].originalIndex != 4 );
+		}
+	}
+
+	return 0;
+}
+
+// The index order flag returns the same points sorted by input index
+static int Hull2DIndexOrderTest( void )
+{
+	b3Vec2 input[8] = {
+		{ 1.0f, 2.0f },	 { -2.5f, 0.4f }, { 2.0f, -1.0f }, { 0.2f, 0.1f },
+		{ -2.0f, -1.0f }, { 2.5f, 0.5f }, { 0.0f, -1.5f }, { -1.0f, 1.8f },
+	};
+
+	b3Point2D pts[8];
+	b3Point2D hull[16];
+	FillPoints2D( pts, input, 8 );
+	int count1 = b3Hull2D( pts, 8, hull, 0 );
+
+	bool onHull[8] = { false };
+	for ( int i = 0; i < count1; ++i )
+	{
+		onHull[hull[i].originalIndex] = true;
+	}
+
+	FillPoints2D( pts, input, 8 );
+	int count2 = b3Hull2D( pts, 8, hull, b3_hull2DIndexOrder );
+	ENSURE( count2 == count1 );
+
+	for ( int i = 0; i < count2; ++i )
+	{
+		ENSURE( onHull[hull[i].originalIndex] );
+		ENSURE( i == 0 || hull[i - 1].originalIndex < hull[i].originalIndex );
+	}
+
+	return 0;
+}
+
 int HullTest( void )
 {
 	RUN_SUBTEST( CreateHullCubeTest );
@@ -456,6 +891,17 @@ int HullTest( void )
 	RUN_SUBTEST( CreateHullSphereStressTest );
 	RUN_SUBTEST( CreateHullMergeChurnStressTest );
 	RUN_SUBTEST( CreateHullDegenerateTest );
+	RUN_SUBTEST( TransformedBoxHullTest );
+	RUN_SUBTEST( Hull2DSquareTest );
+	RUN_SUBTEST( Hull2DCollinearTest );
+	RUN_SUBTEST( Hull2DWeldTest );
+	RUN_SUBTEST( Hull2DOrderTest );
+	RUN_SUBTEST( Hull2DNearCollinearTest );
+	RUN_SUBTEST( Hull2DKeepCollinearTest );
+	RUN_SUBTEST( Hull2DExactMergeTest );
+	RUN_SUBTEST( Hull2DIndexOrderTest );
+	RUN_SUBTEST( SimplifyHull2DTargetTest );
+	RUN_SUBTEST( SimplifyHull2DNoopTest );
 
 	return 0;
 }

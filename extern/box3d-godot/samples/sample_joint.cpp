@@ -1953,6 +1953,67 @@ public:
 
 static int sampleBridgeIndex = RegisterSample( "Joints", "Bridge", Bridge::Create );
 
+class FoldOut : public Sample
+{
+public:
+	explicit FoldOut( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 20.0f, 10.0f, 28.0f, { 0.0f, 7.0f, 0.0f } );
+		}
+
+		float halfLength = 2.0f;
+		float spacing = 1.0f;
+
+		b3BoxHull box = b3MakeBoxHull( halfLength, 0.1f, 0.25f );
+
+		b3Quat axisQuat = b3ComputeQuatBetweenUnitVectors( b3Vec3_axisZ, b3Vec3_axisY );
+
+		b3RevoluteJointDef jointDef = b3DefaultRevoluteJointDef();
+		jointDef.base.localFrameA.p = { -halfLength, 1.0f, 0.0f };
+		jointDef.base.localFrameA.q = axisQuat;
+		jointDef.base.localFrameB.q = axisQuat;
+		jointDef.base.drawScale = 0.5f;
+		jointDef.base.constraintHertz = 240.0f;
+		jointDef.enableMotor = true;
+		jointDef.maxMotorTorque = 1000.0f;
+
+		b3BodyId prevBodyId = AddGroundBox( 20.0f );
+
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.position.y = 0.5f * spacing;
+		bodyDef.type = b3_dynamicBody;
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.density *= 2.0f;
+
+		for ( int i = 0; i < 6; ++i )
+		{
+			b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
+			b3CreateHullShape( bodyId, &shapeDef, &box.base );
+
+			float x = ( i & 1 ) ? halfLength : -halfLength;
+
+			jointDef.base.bodyIdA = prevBodyId;
+			jointDef.base.bodyIdB = bodyId;
+			jointDef.base.localFrameB.p = { x, -0.5f * spacing, 0.0f };
+			b3CreateRevoluteJoint( m_worldId, &jointDef );
+
+			bodyDef.position.y += spacing;
+			jointDef.base.localFrameA.p = { -x, 0.5f * spacing, 0.0f };
+			prevBodyId = bodyId;
+		}
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new FoldOut( context );
+	}
+};
+
+static int sampleFoldOut = RegisterSample( "Joints", "Fold Out", FoldOut::Create );
+
 // This test ensures joints work correctly with bodies that have motion locks
 class MotionLocks : public Sample
 {
@@ -2000,6 +2061,8 @@ public:
 			assert( m_count < m_capacity );
 
 			bodyDef.position = position;
+			bodyDef.angularDamping = 0.5f;
+
 			m_bodyIds[m_count] = b3CreateBody( m_worldId, &bodyDef );
 			b3CreateHullShape( m_bodyIds[m_count], &shapeDef, &box.base );
 
@@ -2257,6 +2320,8 @@ public:
 		m_upperSteeringDegrees = 45.0f;
 		m_maxSteeringTorque = 5.0f;
 		m_targetSteeringDegrees = 0.0f;
+		m_wheelType = WheelType::sphere;
+		m_cylinderSides = 16;
 
 		b3BodyId groundId;
 		{
@@ -2308,14 +2373,9 @@ public:
 			b3CreateParallelJoint( m_worldId, &parallelJointDef );
 		}
 
-		shapeDef.density = 2.0f;
-		shapeDef.baseMaterial.friction = 3.0f;
-
 		bodyDef.type = b3_dynamicBody;
 		bodyDef.allowFastRotation = true;
 		bodyDef.rotation = b3ComputeQuatBetweenUnitVectors( b3Vec3_axisY, b3Vec3_axisZ );
-
-		// b3HullData* hull = b3CreateCylinder( 0.25f, 0.4f, 0.0f, 16 );
 
 		b3WheelJointDef jointDef = b3DefaultWheelJointDef();
 		jointDef.base.bodyIdA = m_chassisId;
@@ -2338,15 +2398,11 @@ public:
 		jointDef.lowerSteeringLimit = B3_PI / 180.0f * m_lowerSteeringDegrees;
 		jointDef.upperSteeringLimit = B3_PI / 180.0f * m_upperSteeringDegrees;
 
-		b3Sphere sphere = { b3Vec3_zero, 0.4f };
-
 		{
 			bodyDef.position = { 1.5f, 2.0f, 0.8f };
-			b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
-			b3CreateSphereShape( bodyId, &shapeDef, &sphere );
-			// b3CreateHullShape( bodyId, &shapeDef, hull );
+			m_wheelIds[0] = b3CreateBody( m_worldId, &bodyDef );
 
-			jointDef.base.bodyIdB = bodyId;
+			jointDef.base.bodyIdB = m_wheelIds[0];
 			jointDef.base.localFrameA.p = { 1.5f, -0.5f, 0.8f };
 			jointDef.enableSteering = true;
 			jointDef.enableSpinMotor = false;
@@ -2355,11 +2411,9 @@ public:
 
 		{
 			bodyDef.position = { 1.5f, 2.0f, -0.8f };
-			b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
-			b3CreateSphereShape( bodyId, &shapeDef, &sphere );
-			// b3CreateHullShape( bodyId, &shapeDef, hull );
+			m_wheelIds[1] = b3CreateBody( m_worldId, &bodyDef );
 
-			jointDef.base.bodyIdB = bodyId;
+			jointDef.base.bodyIdB = m_wheelIds[1];
 			jointDef.base.localFrameA.p = { 1.5f, -0.5f, -0.8f };
 			jointDef.enableSteering = true;
 			jointDef.enableSpinMotor = false;
@@ -2368,11 +2422,9 @@ public:
 
 		{
 			bodyDef.position = { -1.5f, 2.0f, 0.8f };
-			b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
-			b3CreateSphereShape( bodyId, &shapeDef, &sphere );
-			// b3CreateHullShape( bodyId, &shapeDef, hull );
+			m_wheelIds[2] = b3CreateBody( m_worldId, &bodyDef );
 
-			jointDef.base.bodyIdB = bodyId;
+			jointDef.base.bodyIdB = m_wheelIds[2];
 			jointDef.base.localFrameA.p = { -1.5f, -0.5f, 0.8f };
 			jointDef.enableSteering = false;
 			jointDef.enableSpinMotor = true;
@@ -2381,18 +2433,21 @@ public:
 
 		{
 			bodyDef.position = { -1.5f, 2.0f, -0.8f };
-			b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
-			b3CreateSphereShape( bodyId, &shapeDef, &sphere );
-			// b3CreateHullShape( bodyId, &shapeDef, hull );
+			m_wheelIds[3] = b3CreateBody( m_worldId, &bodyDef );
 
-			jointDef.base.bodyIdB = bodyId;
+			jointDef.base.bodyIdB = m_wheelIds[3];
 			jointDef.base.localFrameA.p = { -1.5f, -0.5f, -0.8f };
 			jointDef.enableSteering = false;
 			jointDef.enableSpinMotor = true;
 			m_rearRightId = b3CreateWheelJoint( m_worldId, &jointDef );
 		}
 
-		// b3DestroyHull( hull );
+		for ( int i = 0; i < 4; ++i )
+		{
+			m_wheelShapeIds[i] = b3_nullShapeId;
+		}
+
+		CreateWheelShapes();
 
 		m_camera->m_thirdPerson = false;
 
@@ -2403,12 +2458,65 @@ public:
 
 	~Driving() override
 	{
-		if (m_camera->m_thirdPerson)
+		if ( m_camera->m_thirdPerson )
 		{
 			m_camera->m_thirdPerson = false;
 			sapp_lock_mouse( false );
 		}
 		b3DestroyHeightField( m_heightField );
+	}
+
+	void CreateWheelShapes()
+	{
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.density = 2.0f;
+		shapeDef.baseMaterial.friction = 3.0f;
+
+		float radius = 0.4f;
+		float width = 0.25f;
+
+		b3HullData* cylinder = nullptr;
+		if ( m_wheelType == WheelType::cylinder )
+		{
+			float w = 1.5f * width;
+			cylinder = b3CreateCylinder( w, radius, -0.5f * w, m_cylinderSides );
+		}
+
+		for ( int i = 0; i < 4; ++i )
+		{
+			if ( B3_IS_NON_NULL( m_wheelShapeIds[i] ) )
+			{
+				b3DestroyShape( m_wheelShapeIds[i], false );
+			}
+
+			b3BodyId bodyId = m_wheelIds[i];
+
+			switch ( m_wheelType )
+			{
+				case WheelType::sphere:
+				{
+					b3Sphere sphere = { b3Vec3_zero, radius };
+					m_wheelShapeIds[i] = b3CreateSphereShape( bodyId, &shapeDef, &sphere );
+				}
+				break;
+
+				case WheelType::capsule:
+				{
+					b3Capsule capsule = { { 0.0f, -0.5f * width, 0.0f }, { 0.0f, 0.5f * width, 0.0f }, radius };
+					m_wheelShapeIds[i] = b3CreateCapsuleShape( bodyId, &shapeDef, &capsule );
+				}
+				break;
+
+				case WheelType::cylinder:
+					m_wheelShapeIds[i] = b3CreateHullShape( bodyId, &shapeDef, cylinder );
+					break;
+			}
+		}
+
+		if ( cylinder != nullptr )
+		{
+			b3DestroyHull( cylinder );
+		}
 	}
 
 	void Keyboard( int key, int action, int mods ) override
@@ -2421,6 +2529,32 @@ public:
 
 	bool DrawControls() override
 	{
+		ImGui::Text( "Wheels" );
+		if ( ImGui::RadioButton( "Sphere", m_wheelType == WheelType::sphere ) )
+		{
+			m_wheelType = WheelType::sphere;
+			CreateWheelShapes();
+		}
+
+		if ( ImGui::RadioButton( "Capsule", m_wheelType == WheelType::capsule ) )
+		{
+			m_wheelType = WheelType::capsule;
+			CreateWheelShapes();
+		}
+
+		if ( ImGui::RadioButton( "Cylinder", m_wheelType == WheelType::cylinder ) )
+		{
+			m_wheelType = WheelType::cylinder;
+			CreateWheelShapes();
+		}
+
+		if ( ImGui::SliderInt( "Sides", &m_cylinderSides, 3, 32 ) && m_wheelType == WheelType::cylinder )
+		{
+			CreateWheelShapes();
+		}
+
+		ImGui::Separator();
+
 		ImGui::Text( "Suspension" );
 		if ( ImGui::SliderFloat( "Min##Suspension", &m_lowerTranslation, -10.0f, 10.0f, "%.1f" ) )
 		{
@@ -2596,8 +2730,19 @@ public:
 		return new Driving( context );
 	}
 
+	enum class WheelType
+	{
+		sphere,
+		capsule,
+		cylinder,
+	};
+
 	b3HeightFieldData* m_heightField;
 	b3BodyId m_chassisId;
+	b3BodyId m_wheelIds[4];
+	b3ShapeId m_wheelShapeIds[4];
+	WheelType m_wheelType;
+	int m_cylinderSides;
 	b3JointId m_frontLeftId;
 	b3JointId m_frontRightId;
 	b3JointId m_rearLeftId;

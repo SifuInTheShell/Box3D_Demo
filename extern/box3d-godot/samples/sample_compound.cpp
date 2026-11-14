@@ -1,17 +1,19 @@
 // SPDX-FileCopyrightText: 2025 Erin Catto
 // SPDX-License-Identifier: MIT
 
+#include "geometric_mover.h"
 #include "gfx/debug_adapter.h"
 #include "gfx/draw.h"
 #include "human.h"
 #include "mesh_loader.h"
-#include "mover.h"
 #include "sample.h"
 #include "utils.h"
 
 #include "box3d/box3d.h"
 
 #include <imgui.h>
+
+#include <vector>
 
 class SimpleCompound : public Sample
 {
@@ -93,7 +95,7 @@ public:
 		b3Transform transform = { { 0.0f, 0.01f, 0.0f }, b3Quat_identity };
 		DrawAxes( b3MakeWorldTransform( transform ), 1.0f );
 
-		int height = b3DynamicTree_GetHeight( &m_compound->tree );
+		int height = m_compound->treeHeight;
 		DrawTextLine( "compound tree height = %d", height );
 	}
 
@@ -153,7 +155,7 @@ public:
 		b3Transform transform = { { 0.0f, 0.01f, 0.0f }, b3Quat_identity };
 		DrawAxes( b3MakeWorldTransform( transform ), 1.0f );
 
-		int height = b3DynamicTree_GetHeight( &m_compound->tree );
+		int height = m_compound->treeHeight;
 		DrawTextLine( "compound tree height = %d", height );
 	}
 
@@ -227,7 +229,7 @@ public:
 		b3Transform transform = { { 0.0f, 0.01f, 0.0f }, b3Quat_identity };
 		DrawAxes( b3MakeWorldTransform( transform ), 1.0f );
 
-		int height = b3DynamicTree_GetHeight( &m_compound->tree );
+		int height = m_compound->treeHeight;
 		DrawTextLine( "compound tree height = %d", height );
 	}
 
@@ -345,8 +347,8 @@ public:
 		DrawTextLine( "compound hull count = %d, mesh count = %d", m_compound->hullCount, m_compound->meshCount );
 		DrawTextLine( "compound byte count = %d", m_compound->byteCount );
 
-		int treeBytes = b3DynamicTree_GetByteCount( &m_compound->tree );
-		int height = b3DynamicTree_GetHeight( &m_compound->tree );
+		int treeBytes = m_compound->nodeCount * (int)sizeof( b3TreeNode );
+		int height = m_compound->treeHeight;
 		DrawTextLine( "compound tree byte count = %d, height = %d", treeBytes, height );
 	}
 
@@ -461,8 +463,8 @@ public:
 
 		DrawTextLine( "compound instance count = %d, byte count = %d", m_compound->meshCount, m_compound->byteCount );
 
-		int treeBytes = b3DynamicTree_GetByteCount( &m_compound->tree );
-		int height = b3DynamicTree_GetHeight( &m_compound->tree );
+		int treeBytes = m_compound->nodeCount * (int)sizeof( b3TreeNode );
+		int height = m_compound->treeHeight;
 		DrawTextLine( "compound tree byte count = %d, height = %d", treeBytes, height );
 	}
 
@@ -484,6 +486,39 @@ static bool OverlapResultFcn( b3ShapeId shapeId, void* context )
 	return false;
 }
 
+struct VillageBoxQuery
+{
+	b3AABB aabb;
+	int shapeCount;
+	int childCount;
+};
+
+static bool CountCompoundChildFcn( const b3CompoundData* compound, int childIndex, void* context )
+{
+	(void)compound;
+	(void)childIndex;
+	int* count = (int*)context;
+	*count += 1;
+	return true;
+}
+
+// The world query only reaches the compound as a whole, so descend into its children like a game would
+static bool VillageBoxQueryFcn( b3ShapeId shapeId, void* context )
+{
+	VillageBoxQuery* query = (VillageBoxQuery*)context;
+	query->shapeCount += 1;
+
+	if ( b3Shape_GetType( shapeId ) == b3_compoundShape )
+	{
+		b3WorldTransform bodyTransform = b3Body_GetTransform( b3Shape_GetBody( shapeId ) );
+		b3Transform worldToLocal = b3InvMulWorldTransforms( bodyTransform, b3WorldTransform_identity );
+		b3AABB localBox = b3AABB_Transform( worldToLocal, query->aabb );
+		b3QueryCompound( b3Shape_GetCompound( shapeId ), localBox, CountCompoundChildFcn, &query->childCount );
+	}
+
+	return true;
+}
+
 class Village : public Sample
 {
 public:
@@ -501,7 +536,9 @@ public:
 		}
 
 		m_launchSpeedScale = 2.0f;
-		m_mover.Initialize( this, position );
+		GeometricMoverDef moverDef;
+		moverDef.position = position;
+		m_mover.Create( m_worldId, &moverDef );
 
 		{
 			constexpr int capsuleCapacity = gridCount * gridCount / 8 + 1;
@@ -545,6 +582,7 @@ public:
 							assert( capsuleIndex < capsuleCapacity );
 							capsules[capsuleIndex].capsule = { p1, p2, radius };
 							capsules[capsuleIndex].material = material;
+							capsules[capsuleIndex].material.userMaterialId = 1;
 							capsuleIndex += 1;
 						}
 						else
@@ -552,6 +590,7 @@ public:
 							assert( sphereIndex < capsuleCapacity );
 							spheres[sphereIndex].sphere = { p1, radius };
 							spheres[sphereIndex].material = material;
+							spheres[sphereIndex].material.userMaterialId = 2;
 							sphereIndex += 1;
 						}
 					}
@@ -559,6 +598,7 @@ public:
 					hulls[hullIndex].hull = &box.base;
 					hulls[hullIndex].transform = transform;
 					hulls[hullIndex].material = material;
+					hulls[hullIndex].material.userMaterialId = 3;
 
 					hullIndex += 1;
 				}
@@ -574,9 +614,11 @@ public:
 			constexpr int materialCapacity = 5;
 
 			b3SurfaceMaterial meshMaterials[materialCapacity];
+
+			// Without the building mesh the village still stands, just with no buildings
 			b3MeshData* buildingMesh = CreateMeshData( "data/meshes/building.obj", 1.0f, false, false, true, true );
 
-			int materialCount = buildingMesh->materialCount;
+			int materialCount = buildingMesh != nullptr ? buildingMesh->materialCount : 0;
 			assert( materialCount <= materialCapacity );
 
 			for ( int i = 0; i < materialCount; ++i )
@@ -593,11 +635,11 @@ public:
 				meshMaterials[i].userMaterialId = i + 42;
 			}
 
-			b3CompoundMeshDef* meshes = new b3CompoundMeshDef[meshCount];
+			b3CompoundMeshDef* meshes = buildingMesh != nullptr ? new b3CompoundMeshDef[meshCount] : nullptr;
 			transform = b3Transform_identity;
 
 			int meshIndex = 0;
-			for ( int i = 0; i < meshGridCount; ++i )
+			for ( int i = 0; meshes != nullptr && i < meshGridCount; ++i )
 			{
 				transform.p.x = ( 2.0f * i - meshGridCount ) * b + 0.5f * b;
 
@@ -630,7 +672,7 @@ public:
 				}
 			}
 
-			assert( meshIndex == meshCount );
+			assert( meshes == nullptr || meshIndex == meshCount );
 
 			b3CompoundDef def = {};
 			def.capsules = capsules;
@@ -639,7 +681,7 @@ public:
 			def.hulls = hulls;
 			def.hullCount = hullCount;
 			def.meshes = meshes;
-			def.meshCount = meshCount;
+			def.meshCount = meshIndex;
 			def.spheres = spheres;
 			def.sphereCount = sphereIndex;
 
@@ -665,7 +707,7 @@ public:
 			delete[] spheres;
 			spheres = nullptr;
 
-			b3DestroyMesh( buildingMesh );
+			DestroyMeshData( buildingMesh );
 		}
 
 		m_rayOrigin = { -0.45f * m_worldWidth, 20.0f, -0.45f * m_worldWidth };
@@ -684,19 +726,93 @@ public:
 		}
 	}
 
+	// Fixed seed so timings compare across runs and builds
+	void CreateStressQueries()
+	{
+		uint32_t savedSeed = g_randomSeed;
+		g_randomSeed = 271828;
+
+		float h = 0.45f * m_worldWidth;
+
+		m_stressRays.resize( m_stressRayCount );
+		for ( StressRay& ray : m_stressRays )
+		{
+			ray.origin = { RandomFloatRange( -h, h ), 20.0f, RandomFloatRange( -h, h ) };
+			ray.translation = { RandomFloatRange( -10.0f, 10.0f ), -40.0f, RandomFloatRange( -10.0f, 10.0f ) };
+		}
+
+		m_stressBoxes.resize( m_stressBoxCount );
+		for ( b3AABB& box : m_stressBoxes )
+		{
+			b3Vec3 center = { RandomFloatRange( -h, h ), RandomFloatRange( 0.0f, 8.0f ), RandomFloatRange( -h, h ) };
+			b3Vec3 extents = RandomVec3( { 0.5f, 0.5f, 0.5f }, { 4.0f, 4.0f, 4.0f } );
+			box = { center - extents, center + extents };
+		}
+
+		g_randomSeed = savedSeed;
+	}
+
+	void RunStressQueries()
+	{
+		b3QueryFilter filter = b3DefaultQueryFilter();
+
+		uint64_t ticks = b3GetTicks();
+
+		int rayHitCount = 0;
+		for ( const StressRay& ray : m_stressRays )
+		{
+			CastClosestContext context = {};
+			(void)b3World_CastRay( m_worldId, ray.origin, ray.translation, filter, CastClosestCallback, &context );
+			rayHitCount += context.hit ? 1 : 0;
+		}
+
+		float rayTime = b3GetMillisecondsAndReset( &ticks );
+
+		VillageBoxQuery query = {};
+		for ( b3AABB box : m_stressBoxes )
+		{
+			query.aabb = box;
+			(void)b3World_OverlapAABB( m_worldId, box, filter, VillageBoxQueryFcn, &query );
+		}
+
+		float boxTime = b3GetMilliseconds( ticks );
+
+		int rayCount = (int)m_stressRays.size();
+		int boxCount = (int)m_stressBoxes.size();
+
+		DrawTextLine( "rays = %d, hits = %d", rayCount, rayHitCount );
+		DrawTextLine( "ray time = %.3f ms, ave = %.3f us", rayTime, 1000.0f * rayTime / rayCount );
+		DrawTextLine( "aabb queries = %d, shapes = %d, children = %d", boxCount, query.shapeCount, query.childCount );
+		DrawTextLine( "aabb time = %.3f ms, ave = %.3f us", boxTime, 1000.0f * boxTime / boxCount );
+	}
+
+	bool DrawControls() override
+	{
+		bool changed = ImGui::Checkbox( "Query Stress", &m_stressQueries );
+		changed = ImGui::SliderInt( "Rays", &m_stressRayCount, 1, 100000 ) || changed;
+		changed = ImGui::SliderInt( "AABB Queries", &m_stressBoxCount, 1, 100000 ) || changed;
+
+		if ( changed && m_stressQueries )
+		{
+			CreateStressQueries();
+		}
+
+		return true;
+	}
+
 	void Render() override
 	{
 		Sample::Render();
 		b3Transform transform = { { 0.0f, 0.01f, 0.0f }, b3Quat_identity };
 		DrawAxes( b3MakeWorldTransform( transform ), 4.0f );
 
-		DrawTextLine( "surface type = %d", m_userMaterialId );
+		DrawTextLine( "surface type = %d", (int)m_userMaterialId );
 		DrawTextLine( "compound capsules/hulls/meshes/sphere = %d / %d / %d / %d", m_compound->capsuleCount,
 					  m_compound->hullCount, m_compound->meshCount, m_compound->sphereCount );
 		DrawTextLine( "compound byte count = %d", m_compound->byteCount );
 
-		int treeBytes = b3DynamicTree_GetByteCount( &m_compound->tree );
-		int height = b3DynamicTree_GetHeight( &m_compound->tree );
+		int treeBytes = m_compound->nodeCount * (int)sizeof( b3TreeNode );
+		int height = m_compound->treeHeight;
 		DrawTextLine( "compound tree byte count = %d, height = %d", treeBytes, height );
 
 		int total = 0;
@@ -706,8 +822,39 @@ public:
 
 	void Step() override
 	{
-		m_mover.Step( nullptr, 0, true );
+		MoverInput input = GetMoverInput();
+		if ( input.jump )
+		{
+			m_mover.Jump();
+		}
+
+		float speedScale = 1.0f;
+		if ( input.walk )
+		{
+			speedScale = 0.25f;
+		}
+		else if ( m_mover.m_onGround && input.sprint )
+		{
+			speedScale = 1.5f;
+		}
+		float moverTimeStep = m_context->hertz > 0.0f ? 1.0f / m_context->hertz : 0.0f;
+		m_mover.Update( moverTimeStep, input.forward, input.right, input.throttle, speedScale );
+
+		if ( m_camera->m_thirdPerson )
+		{
+			m_camera->m_pivot = m_mover.m_position;
+			m_camera->UpdateTransform();
+		}
+
+		SetDrawOrigin( m_camera->DrawOrigin() );
+		m_mover.Draw();
+
 		DrawTextLine( "third person (T) = %d", m_camera->m_thirdPerson );
+
+		if ( m_stressQueries )
+		{
+			RunStressQueries();
+		}
 
 		b3Vec3 translation = { 10.0f, -40.0f, -5.0f };
 		b3QueryFilter filter = b3DefaultQueryFilter();
@@ -724,7 +871,7 @@ public:
 				DrawLine( p1, p2, MakeColor( b3_colorYellow ) );
 				DrawPoint( p1, 8.0f, MakeColor( b3_colorLightCoral ) );
 				DrawTextLine( "ray hit triangle/child/material = %d / %d / %d", context.triangleIndex, context.childIndex,
-							  context.materialId );
+							  (int)context.materialId );
 			}
 			else
 			{
@@ -749,7 +896,7 @@ public:
 				b3Sphere sphere = { b3Vec3_zero, 0.25f };
 				DrawSolidSphere( { position, b3Quat_identity }, sphere, MakeColor( b3_colorOrchid ) );
 				DrawTextLine( "shape hit triangle/child/material = %d / %d / %d", context.triangleIndex, context.childIndex,
-							  context.materialId );
+							  (int)context.materialId );
 			}
 			else
 			{
@@ -795,10 +942,22 @@ public:
 		return new Village( context );
 	}
 
+	struct StressRay
+	{
+		b3Pos origin;
+		b3Vec3 translation;
+	};
+
 	b3CompoundData* m_compound;
-	CharacterMover m_mover;
+	GeometricMover m_mover;
 	float m_worldWidth;
 	b3Pos m_rayOrigin;
+
+	std::vector<StressRay> m_stressRays;
+	std::vector<b3AABB> m_stressBoxes;
+	int m_stressRayCount = 1000;
+	int m_stressBoxCount = 1000;
+	bool m_stressQueries = false;
 };
 
 static int sampleVillage = RegisterSample( "Compound", "Village", Village::Create );

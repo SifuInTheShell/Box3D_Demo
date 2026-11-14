@@ -14,6 +14,7 @@
 #include "gfx/debug_adapter.h"
 #include "gfx/keycodes.h"
 #include "gfx/renderer.h"
+#include "gfx/text.h"
 #include "host/gui.h"
 #include "sample.h"
 #include "sokol_app.h"
@@ -99,7 +100,6 @@ static void OnInit( void )
 #if defined( _WIN32 )
 	timeBeginPeriod( 1 );
 #endif
-
 	const sg_environment env = sglue_environment();
 	InitRenderer( &env );
 	InitUI( &env, OnDrawUI );
@@ -161,6 +161,17 @@ static void OnEvent( const sapp_event* e )
 		s_context.camera.OnEvent( e );
 	}
 
+	// Releases go to the key table even when the UI captures them. Otherwise Ctrl let go
+	// while the Ctrl+O picker is open stays down in the next sample.
+	if ( e->type == SAPP_EVENTTYPE_KEY_UP )
+	{
+		SetKeyDown( e->key_code, false );
+	}
+	else if ( e->type == SAPP_EVENTTYPE_UNFOCUSED )
+	{
+		ClearKeysDown();
+	}
+
 	if ( uiCaptured )
 	{
 		return;
@@ -182,7 +193,18 @@ static void OnEvent( const sapp_event* e )
 				switch ( e->key_code )
 				{
 					case SAPP_KEYCODE_TAB:
-						s_context.showUI = !s_context.showUI;
+						if ( mods & SAPP_MODIFIER_SHIFT )
+						{
+							bool hide = s_context.showUI || s_context.showText;
+							s_context.showUI = !hide;
+							s_context.showText = !hide;
+						}
+						else
+						{
+							// Plain Tab also restores text so it always leads back to the full view
+							s_context.showUI = !s_context.showUI;
+							s_context.showText = true;
+						}
 						break;
 
 					case SAPP_KEYCODE_ESCAPE:
@@ -195,7 +217,10 @@ static void OnEvent( const sapp_event* e )
 						}
 						else
 						{
+							// The replay viewer redraws the highlight from its own selection every
+							// frame, so it has to clear that too
 							ClearSelection();
+							s_context.sample->Keyboard( e->key_code, ACTION_PRESS, mods );
 						}
 						break;
 
@@ -214,11 +239,15 @@ static void OnEvent( const sapp_event* e )
 							// Ctrl+O opens the fuzzy picker. Force the UI visible so it shows.
 							s_context.showUI = true;
 							s_context.openSamplePicker = true;
+							break;
 						}
-						else
-						{
-							s_context.singleStep += ( mods & SAPP_MODIFIER_SHIFT ) ? 5 : 1;
-						}
+						s_context.sample->Keyboard( e->key_code, ACTION_PRESS, mods );
+						break;
+
+					// Step forward. Backward is , and only a sample that can rewind
+					// handles it, so that key falls through to the sample.
+					case KEY_PERIOD:
+						s_context.singleStep += ( mods & SAPP_MODIFIER_SHIFT ) ? 5 : 1;
 						break;
 
 					case SAPP_KEYCODE_P:
@@ -230,56 +259,35 @@ static void OnEvent( const sapp_event* e )
 						s_context.showMetrics = !s_context.showMetrics;
 						break;
 
+					case SAPP_KEYCODE_I:
+						s_context.showProfile = !s_context.showProfile;
+						break;
+
 					case SAPP_KEYCODE_R:
 						SelectSample( &s_context, s_context.sampleIndex, true );
 						break;
 
 					case SAPP_KEYCODE_LEFT_BRACKET:
-						SelectSample( &s_context, b3MaxInt( 0, s_context.sampleIndex - 1 ), false );
+						SelectSample( &s_context, ( s_context.sampleIndex + g_sampleCount - 1 ) % g_sampleCount, false );
 						break;
 
 					case SAPP_KEYCODE_RIGHT_BRACKET:
-						SelectSample( &s_context, b3MinInt( g_sampleCount - 1, s_context.sampleIndex + 1 ), false );
+						SelectSample( &s_context, ( s_context.sampleIndex + 1 ) % g_sampleCount, false );
 						break;
 
 					case SAPP_KEYCODE_F:
-					{
-						// Frame the selection, or let the sample frame its whole scene when nothing is
-						// selected. A non-body selection such as a recorded query supplies its own bounds and
-						// takes priority over the hovered body. The replay viewer's scene lives in a
-						// player-owned world, not the base world, so the whole-scene case routes through
-						// FocusHome.
-						Camera& cam = s_context.camera;
-						float aspect = cam.m_height > 0 ? (float)cam.m_width / (float)cam.m_height : 1.0f;
-						b3AABB bounds;
-						if ( s_context.sample->FocusBounds( &bounds ) )
-						{
-							cam.Frame( bounds, aspect, 1.5f );
-						}
-						else
-						{
-							b3BodyId bodyId = s_context.sample->FocusBody();
-							if ( B3_IS_NON_NULL( bodyId ) )
-							{
-								cam.Frame( b3Body_ComputeAABB( bodyId ), aspect, 1.5f );
-							}
-							else
-							{
-								s_context.sample->FocusHome();
-							}
-						}
-					}
-					break;
+						FrameSelection( &s_context );
+						break;
+
+					case SAPP_KEYCODE_HOME:
+						s_context.sample->FocusHome();
+						break;
 
 					default:
 						s_context.sample->Keyboard( e->key_code, ACTION_PRESS, mods );
 						break;
 				}
 			}
-			break;
-
-		case SAPP_EVENTTYPE_KEY_UP:
-			SetKeyDown( e->key_code, false );
 			break;
 
 		case SAPP_EVENTTYPE_CHAR:
@@ -416,6 +424,12 @@ static void OnFrame( void )
 
 	s_context.sample->Step();
 	s_context.sample->Render();
+
+	// Before RenderFrame so world labels drop too
+	if ( s_context.showText == false )
+	{
+		ResetTextArena();
+	}
 
 	FrameInput fi{};
 	fi.view = camera.View();
@@ -565,22 +579,18 @@ static sapp_desc BuildAppDesc( int argc, char** argv )
 	return desc;
 }
 
-// We own main (SOKOL_NO_ENTRY) so the leak dump can run after sapp_run returns,
-// once sokol has torn down its window and context. On Windows sapp_run returns
-// after that teardown; on macOS it may not return, so the dump is Windows only.
+// The leak dump runs at CRT exit, after static destructors. Libraries such as ImGuizmo keep
+// heap backed containers at file scope, and a dump right after sapp_run reports them.
 int main( int argc, char** argv )
 {
 #if defined( _MSC_VER )
 	_CrtSetReportMode( _CRT_WARN, _CRTDBG_MODE_DEBUG | _CRTDBG_MODE_FILE );
 	_CrtSetReportFile( _CRT_WARN, _CRTDBG_FILE_STDOUT );
+	_CrtSetDbgFlag( _CrtSetDbgFlag( _CRTDBG_REPORT_FLAG ) | _CRTDBG_LEAK_CHECK_DF );
 #endif
 
 	sapp_desc desc = BuildAppDesc( argc, argv );
 	sapp_run( &desc );
-
-#if defined( _MSC_VER )
-	_CrtDumpMemoryLeaks();
-#endif
 
 	return s_exitCode;
 }

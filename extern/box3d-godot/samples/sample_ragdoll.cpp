@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2025 Erin Catto
 // SPDX-License-Identifier: MIT
 
+#include "gfx/draw.h"
 #include "human.h"
 #include "imgui.h"
 #include "sample.h"
-#include "gfx/draw.h"
+#include "utils.h"
 
 #include "box3d/box3d.h"
 
@@ -207,15 +208,6 @@ static int sampleRagdollMesh = RegisterSample( "Ragdoll", "Mesh", RagdollOnMesh:
 class RagdollPile : public Sample
 {
 public:
-	enum
-	{
-#ifdef NDEBUG
-		e_count = 20
-#else
-		e_count = 8
-#endif
-	};
-
 	explicit RagdollPile( SampleContext* context )
 		: Sample( context )
 	{
@@ -232,9 +224,14 @@ public:
 		m_groundMesh = b3CreateGridMesh( 20, 20, 1.0f, 1, true );
 		b3CreateMeshShape( groundId, &shapeDef, m_groundMesh, b3Vec3_one );
 
-		for ( int i = 0; i < e_count; ++i )
+		g_randomSeed = 42;
+		float a = 0.1f * m_count;
+		b3Vec3 lower = { -a, -a, -a };
+		b3Vec3 upper = { a, a, a };
+		for ( int i = 0; i < m_count; ++i )
 		{
-			b3Pos position = { 0.1f * i, 2.0f + 0.5f * i, -0.1f * i };
+			b3Vec3 offset = RandomVec3( lower, upper );
+			b3Pos position = { offset.x, 2.0f, offset.z };
 			float torque = 10.0f;
 			float hertz = 0.5f;
 			float damping = 0.7f;
@@ -255,8 +252,9 @@ public:
 		return new RagdollPile( context );
 	}
 
+	static constexpr int m_count = m_isDebug ? 8 : 20;
 	b3MeshData* m_groundMesh;
-	Human m_humans[e_count] = {};
+	Human m_humans[m_count] = {};
 };
 
 static int sampleRagdollPile = RegisterSample( "Ragdoll", "Pile", RagdollPile::Create );

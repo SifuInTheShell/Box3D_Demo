@@ -7,13 +7,19 @@
 
 #include <stddef.h>
 
-// Content hash and equality over the whole baked hull. Shared by every hull
-// de-duplication map so they agree on identity.
+// Big enough to handle AVX2.
+#define B3_HULL_SOA_PADDING 8
+
+static inline int b3GetHullSoaStride( int count )
+{
+	return ( count + B3_HULL_SOA_PADDING - 1 ) & ~( B3_HULL_SOA_PADDING - 1 );
+}
+
 uint64_t b3HashHullData( const b3HullData* hull );
 bool b3CompareHullData( const b3HullData* hull1, const b3HullData* hull2 );
 
-// Map keyed by hull content. The world hull database stores a reference count,
-// compound baking stores a byte offset. Implementation lives in hull.c.
+// Map keyed by hull content. The world hull database uses the value as a reference count,
+// while compound baking stores uses the value as a byte offset. Implementation is in hull.c.
 #define NAME b3HullMap
 #define KEY_TY const b3HullData*
 #define VAL_TY int

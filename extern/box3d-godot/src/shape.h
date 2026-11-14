@@ -5,6 +5,7 @@
 
 #include "math_internal.h"
 
+#include "box3d/collision.h"
 #include "box3d/types.h"
 
 #include <stdbool.h>
@@ -19,7 +20,7 @@ typedef enum b3ShapeFlags
 	b3_enableCustomFiltering = 0x04,
 	b3_enableHitEvents = 0x08,
 	b3_enablePreSolveEvents = 0x10,
-	b3_enlargedAABB = 0x20,
+	// 0x20 is free, it was the enlarged AABB flag before the broad-phase marked the tree
 	b3_enableSpeculative = 0x40,
 } b3ShapeFlags;
 
@@ -37,7 +38,6 @@ typedef struct b3Shape
 	float aabbMargin;
 
 	b3AABB aabb;
-	b3AABB fatAABB;
 	b3Vec3 localCentroid;
 
 	int materialCount;
@@ -74,13 +74,14 @@ static inline b3SurfaceMaterial* b3GetShapeMaterials( const b3Shape* shape )
 	return shape->materials != NULL ? shape->materials : (b3SurfaceMaterial*)&shape->material;
 }
 
-void b3CreateShapeProxy( b3Shape* shape, b3BroadPhase* bp, b3BodyType type, b3WorldTransform transform, bool forcePairCreation );
+void b3CreateShapeProxy( b3World* world, b3Shape* shape, b3BodyType type, b3WorldTransform transform, bool forcePairCreation );
 void b3DestroyShapeProxy( b3Shape* shape, b3BroadPhase* bp );
 
 void b3DestroyShapeAllocations( b3World* world, b3Shape* shape );
 
 b3MassData b3ComputeShapeMass( const b3Shape* shape );
 b3ShapeExtent b3ComputeShapeExtent( const b3Shape* shape, b3Vec3 localCenter );
+float b3ComputeShapeMinExtent( const b3Shape* shape, b3Vec3 localCenter );
 
 b3AABB b3ComputeSweptSphereAABB( const b3Sphere* shape, b3Transform xf1, b3Transform xf2 );
 b3AABB b3ComputeSweptCapsuleAABB( const b3Capsule* shape, b3Transform xf1, b3Transform xf2 );
@@ -128,6 +129,10 @@ float b3ComputeHullProjectedArea( const b3HullData* hull, b3Vec3 direction );
 b3Triangle b3GetHeightFieldTriangle( const b3HeightFieldData* heightField, int triangleIndex );
 int b3GetHeightFieldMaterial( const b3HeightFieldData* heightField, int triangleIndex );
 
+bool b3GetHeightFieldNeighborNormal( const b3HeightFieldData* heightField, int triangleIndex, int edgeIndex, b3Vec3* normal );
+bool b3IsHeightFieldVertexConvex( const b3HeightFieldData* heightField, int triangleIndex, int vertexIndex );
+int b3GetHeightFieldVertexTriangles( const b3HeightFieldData* heightField, int vertex, int triangles[6] );
+
 static inline int b3GetHeightFieldTriangleCount( const b3HeightFieldData* heightField )
 {
 	int cellCount = ( heightField->rowCount - 1 ) * ( heightField->columnCount - 1 );
@@ -135,7 +140,74 @@ static inline int b3GetHeightFieldTriangleCount( const b3HeightFieldData* height
 }
 
 // Mesh
-b3Triangle b3GetMeshTriangle( const b3Mesh* mesh, int triangleIndex );
+
+// Making this inline made the tree benchmarks faster.
+static inline b3Triangle b3GetMeshTriangle( const b3Mesh* mesh, int triangleIndex )
+{
+	B3_ASSERT( 0 <= triangleIndex && triangleIndex < mesh->data->triangleCount );
+
+	const b3MeshTriangle* triangles = b3GetMeshTriangles( mesh->data );
+	const b3Vec3* vertices = b3GetMeshVertices( mesh->data );
+
+	b3Triangle result;
+	b3MeshTriangle triangle = triangles[triangleIndex];
+
+	b3Vec3 scale = mesh->scale;
+
+	result.vertices[0] = b3Mul( scale, vertices[triangle.index1] );
+	result.i1 = triangle.index1;
+
+	if ( scale.x * scale.y * scale.z < 0.0f )
+	{
+		result.vertices[1] = b3Mul( scale, vertices[triangle.index3] );
+		result.vertices[2] = b3Mul( scale, vertices[triangle.index2] );
+
+		result.i2 = triangle.index3;
+		result.i3 = triangle.index2;
+
+	}
+	else
+	{
+		result.vertices[1] = b3Mul( scale, vertices[triangle.index2] );
+		result.vertices[2] = b3Mul( scale, vertices[triangle.index3] );
+
+		result.i2 = triangle.index2;
+		result.i3 = triangle.index3;
+	}
+
+	return result;
+}
+
+bool b3GetMeshNeighborNormal( const b3Mesh* mesh, int triangleIndex, int edgeIndex, b3Vec3* normal );
+
+// Returns false if edge is isolated.
+static inline bool b3GetNeighborNormal( const b3Shape* shape, int triangleIndex, int edgeIndex, b3Vec3* normal )
+{
+	if ( shape->type == b3_meshShape )
+	{
+		return b3GetMeshNeighborNormal( &shape->mesh, triangleIndex, edgeIndex, normal );
+	}
+
+	B3_ASSERT( shape->type == b3_heightShape );
+	return b3GetHeightFieldNeighborNormal( shape->heightField, triangleIndex, edgeIndex, normal );
+}
+
+int b3GetMeshVertexFlag( const b3Mesh* mesh, int triangleIndex, int vertexIndex );
+bool b3IsInMeshVertexRing( const b3Mesh* mesh, int triangleIndex, int vertexIndex, b3Vec3 normal, float tolerance );
+int8_t b3QuantizeEdgeAngle( float radians );
+
+static inline bool b3IsConvexVertex( const b3Shape* shape, int triangleIndex, int vertexIndex )
+{
+	if ( shape->type == b3_meshShape )
+	{
+		int flags = b3GetMeshVertexFlag( &shape->mesh, triangleIndex, vertexIndex );
+		return ( flags & ( b3_flatVertex | b3_concaveVertex ) ) == 0;
+	}
+
+	B3_ASSERT( shape->type == b3_heightShape );
+	return b3IsHeightFieldVertexConvex( shape->heightField, triangleIndex, vertexIndex );
+}
+
 bool b3IsValidMesh( const b3MeshData* meshData );
 
 static inline bool b3ShouldShapesCollide( b3Filter filterA, b3Filter filterB )
@@ -152,4 +224,9 @@ static inline bool b3ShouldQueryCollide( const b3Filter* shapeFilter, const b3Qu
 {
 	return ( shapeFilter->categoryBits & queryFilter->maskBits ) != 0 &&
 		   ( shapeFilter->maskBits & queryFilter->categoryBits ) != 0;
+}
+
+static inline bool b3IsConvex( b3ShapeType type )
+{
+	return type == b3_sphereShape || type == b3_capsuleShape || type == b3_hullShape;
 }

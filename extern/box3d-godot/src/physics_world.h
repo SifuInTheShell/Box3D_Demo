@@ -33,6 +33,7 @@ b3DeclareArray( b3SolverSet );
 b3DeclareArray( b3Joint );
 b3DeclareArray( b3Contact );
 b3DeclareArray( b3Island );
+b3DeclareArray( b3AABB );
 b3DeclareArray( b3Shape );
 b3DeclareArray( b3Sensor );
 b3DeclareArray( b3SensorTaskContext );
@@ -76,6 +77,9 @@ typedef struct b3TaskContext
 	// Collect per thread sensor continuous hit events.
 	b3Array( b3SensorHit ) sensorHits;
 
+	// Broad-phase pairs.
+	b3Array( uint64_t ) pairKeys;
+
 	// These bits align with the b3ConstraintGraph::contactBlocks and signal a change in contact status
 	b3BitSet contactStateBitSet;
 
@@ -87,10 +91,6 @@ typedef struct b3TaskContext
 
 	// Fast-path flag: true when this worker set at least one bit in hitEventBitSet this step.
 	bool hasHitEvents;
-
-	// Used to track bodies with shapes that have enlarged AABBs. This avoids having a bit array
-	// that is very large when there are many static shapes.
-	b3BitSet enlargedSimBitSet;
 
 	// Used to put islands to sleep
 	b3BitSet awakeIslandBitSet;
@@ -147,10 +147,12 @@ typedef struct b3World
 	// Provides free list for solver sets.
 	b3IdPool solverSetIdPool;
 
-	// Solvers sets allow sims to be stored in contiguous arrays. The first
-	// set is all static sims. The second set is active sims. The third set is disabled
-	// sims. The remaining sets are sleeping islands.
-	b3Array( b3SolverSet ) solverSets;
+	// Solvers sets allow body sims to be stored in contiguous arrays. The first holds static bodies. The second set
+	// holds disabled bodies. The third holds awake bodies. A growable array holds the sleeping islands.
+	// This is split up so that the static set can be accessed without being remapped during a static query while
+	// the physics step is concurrently putting an island to sleep (race condition).
+	b3SolverSet fixedSets[b3_firstSleepingSet];
+	b3Array( b3SolverSet ) sleepingSets;
 
 	// Used to create stable ids for joints
 	b3IdPool jointIdPool;
@@ -177,8 +179,15 @@ typedef struct b3World
 	// These are sparse arrays that point into the pools above
 	b3Array( b3Shape ) shapes;
 
+	// This follows the shape array and is split out for the hot path in the narrow phase.
+	b3Array( b3AABB ) fatAABBs;
+
+	// Compound shapes are static only, so only the broad-phase static pass can meet one. This
+	// lets a world without compounds skip the shape type read in the pair batch.
+	int compoundShapeCount;
+
 	// Reference counted store of shared hull data keyed by content. Shapes hold a
-	// pointer to the owned copy here. Opaque to avoid leaking the verstable map
+	// pointer to the hull stored in the db. Type erased to avoid leaking the verstable map
 	// type into this header.
 	void* hullDatabase;
 
@@ -228,7 +237,10 @@ typedef struct b3World
 	b3Vec3 gravity;
 	float hitEventThreshold;
 	float restitutionThreshold;
+	int restitutionIterations;
+	bool enableRestitutionPropagation;
 	float maxLinearSpeed;
+	float isotropicInertiaTolerance;
 	float contactSpeed;
 	float contactHertz;
 	float contactDampingRatio;
@@ -253,6 +265,7 @@ typedef struct b3World
 	void* customFilterContext;
 
 	int workerCount;
+	int simdWidth;
 	b3EnqueueTaskCallback* enqueueTaskFcn;
 	b3FinishTaskCallback* finishTaskFcn;
 	void* userTaskContext;
@@ -288,11 +301,35 @@ typedef struct b3World
 	bool inUse;
 } b3World;
 
+static inline b3SolverSet* b3GetSolverSet( b3World* world, int setIndex )
+{
+	if ( setIndex < b3_firstSleepingSet )
+	{
+		B3_ASSERT( 0 <= setIndex );
+		return world->fixedSets + setIndex;
+	}
+
+	return b3Array_Get( world->sleepingSets, setIndex - b3_firstSleepingSet );
+}
+
+static inline b3SolverSet* b3GetFixedSolverSet( b3World* world, int setIndex )
+{
+	B3_ASSERT( 0 <= setIndex && setIndex < b3_firstSleepingSet );
+	return world->fixedSets + setIndex;
+}
+
+static inline int b3GetSolverSetCount( const b3World* world )
+{
+	return b3_firstSleepingSet + world->sleepingSets.count;
+}
+
 b3World* b3GetUnlockedWorldFromId( b3WorldId id );
 b3World* b3GetWorldFromId( b3WorldId id );
 
 b3World* b3GetUnlockedWorld( int index );
 b3World* b3GetWorld( int index );
+
+void b3World_RebuildStaticTree( b3WorldId worldId );
 
 void b3ValidateConnectivity( b3World* world );
 void b3ValidateSolverSets( b3World* world );
@@ -347,4 +384,3 @@ static inline void b3FreeManifolds( b3World* world, b3Manifold* manifolds, int c
 	b3FreeElement( allocator, manifolds );
 	b3UnlockMutex( world->manifoldAllocatorMutex );
 }
-

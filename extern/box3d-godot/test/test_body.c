@@ -385,6 +385,264 @@ static int SetMassDataConsistentVelocity( void )
 	return 0;
 }
 
+// Extents bound the shapes about the center of mass, per axis. An offset shape must count its
+// offset, not just its own size.
+static int ShapeExtents( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+
+	// Kinematic bodies measure from the body origin
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_kinematicBody;
+
+	b3BodyId capsuleId = b3CreateBody( worldId, &bodyDef );
+	b3Capsule capsule = { { -2.0f, 0.0f, 0.0f }, { -1.0f, 0.0f, 0.0f }, 0.2f };
+	b3CreateCapsuleShape( capsuleId, &shapeDef, &capsule );
+
+	b3Vec3 maxExtent = b3Body_GetMaxExtent( capsuleId );
+	ENSURE_SMALL( maxExtent.x - 2.2f, 1e-5f );
+	ENSURE_SMALL( maxExtent.y - 0.2f, 1e-5f );
+	ENSURE_SMALL( maxExtent.z - 0.2f, 1e-5f );
+	ENSURE_SMALL( b3Body_GetMinExtent( capsuleId ) - 0.2f, 1e-5f );
+
+	b3BodyId sphereId = b3CreateBody( worldId, &bodyDef );
+	b3Sphere sphere = { { 1.0f, 2.0f, 3.0f }, 0.5f };
+	b3CreateSphereShape( sphereId, &shapeDef, &sphere );
+
+	maxExtent = b3Body_GetMaxExtent( sphereId );
+	ENSURE_SMALL( maxExtent.x - 1.5f, 1e-5f );
+	ENSURE_SMALL( maxExtent.y - 2.5f, 1e-5f );
+	ENSURE_SMALL( maxExtent.z - 3.5f, 1e-5f );
+	ENSURE_SMALL( b3Body_GetMinExtent( sphereId ) - 0.5f, 1e-5f );
+
+	// Dynamic bodies measure from the center of mass. A light sphere hung off a cube pulls the
+	// center toward it, so the far side of the sphere is the widest point.
+	bodyDef.type = b3_dynamicBody;
+	b3BodyId cubeId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull cube = b3MakeCubeHull( 0.5f );
+	b3CreateHullShape( cubeId, &shapeDef, &cube.base );
+	b3Sphere offsetSphere = { { 1.0f, 0.0f, 0.0f }, 0.2f };
+	b3CreateSphereShape( cubeId, &shapeDef, &offsetSphere );
+
+	b3Vec3 localCenter = b3Body_GetLocalCenter( cubeId );
+	ENSURE( 0.0f < localCenter.x && localCenter.x < 0.5f );
+
+	maxExtent = b3Body_GetMaxExtent( cubeId );
+	ENSURE_SMALL( maxExtent.x - ( 1.2f - localCenter.x ), 1e-5f );
+	ENSURE_SMALL( maxExtent.y - 0.5f, 1e-5f );
+	ENSURE_SMALL( maxExtent.z - 0.5f, 1e-5f );
+	ENSURE_SMALL( b3Body_GetMinExtent( cubeId ) - 0.2f, 1e-5f );
+
+	b3Vec3 originExtent = b3Body_GetMaxExtentOrigin( cubeId );
+	ENSURE_SMALL( originExtent.x - 1.2f, 1e-5f );
+	ENSURE_SMALL( originExtent.y - 0.5f, 1e-5f );
+	ENSURE_SMALL( originExtent.z - 0.5f, 1e-5f );
+
+	// A mesh has no mass, so the sphere alone places the center at x = 1 and the far edge of the
+	// mesh at x = -3 is four units out.
+	b3Vec3 vertices[6] = {
+		{ -3.0f, 0.0f, -1.0f }, { -2.0f, 0.0f, 1.0f }, { -1.0f, 0.0f, -1.0f },
+		{ 1.0f, 0.0f, -1.0f },	{ 2.0f, 0.0f, 1.0f },	{ 3.0f, 0.0f, -1.0f },
+	};
+	int32_t indices[6] = { 0, 1, 2, 3, 4, 5 };
+	b3MeshDef meshDef = { 0 };
+	meshDef.vertices = vertices;
+	meshDef.stride = sizeof( b3Vec3 );
+	meshDef.indices = indices;
+	meshDef.vertexCount = 6;
+	meshDef.triangleCount = 2;
+	b3MeshData* mesh = b3CreateMesh( &meshDef, NULL, 0 );
+
+	b3BodyId meshId = b3CreateBody( worldId, &bodyDef );
+	b3CreateSphereShape( meshId, &shapeDef, &offsetSphere );
+	b3CreateMeshShape( meshId, &shapeDef, mesh, (b3Vec3){ 1.0f, 1.0f, 1.0f } );
+
+	localCenter = b3Body_GetLocalCenter( meshId );
+	ENSURE_SMALL( localCenter.x - 1.0f, 1e-5f );
+
+	maxExtent = b3Body_GetMaxExtent( meshId );
+	ENSURE_SMALL( maxExtent.x - 4.0f, 1e-4f );
+	ENSURE_SMALL( maxExtent.y - 0.2f, 1e-4f );
+	ENSURE_SMALL( maxExtent.z - 1.0f, 1e-4f );
+	ENSURE_SMALL( b3Body_GetMinExtent( meshId ) - 0.2f, 1e-5f );
+
+	b3DestroyWorld( worldId );
+	b3DestroyMesh( mesh );
+	return 0;
+}
+
+static int CompoundInertiaConsistency( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.rotation = b3MakeQuatFromAxisAngle( b3Normalize( (b3Vec3){ 0.3f, -0.8f, 0.5f } ), 1.3f );
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3BoxHull boxA = b3MakeOffsetBoxHull( 0.5f, 0.25f, 0.5f, (b3Vec3){ 1.0f, 1.0f, 0.0f } );
+	b3BoxHull boxB = b3MakeOffsetBoxHull( 0.3f, 0.6f, 0.2f, (b3Vec3){ -0.8f, -0.4f, 0.3f } );
+	b3CreateHullShape( bodyId, &shapeDef, &boxA.base );
+	b3CreateHullShape( bodyId, &shapeDef, &boxB.base );
+	b3Body_ApplyMassFromShapes( bodyId );
+
+	b3Matrix3 local = b3Body_GetLocalRotationalInertia( bodyId );
+	ENSURE( b3AbsFloat( local.cy.x ) > 0.1f );
+
+	b3Matrix3 r = b3MakeMatrixFromQuat( bodyDef.rotation );
+	b3Matrix3 world = b3MulMM( b3MulMM( r, local ), b3Transpose( r ) );
+	b3Matrix3 invWorld = b3Body_GetWorldInverseRotationalInertia( bodyId );
+	b3Matrix3 product = b3MulMM( invWorld, world );
+
+	ENSURE_SMALL( product.cx.x - 1.0f, 1.0e-4f );
+	ENSURE_SMALL( product.cy.y - 1.0f, 1.0e-4f );
+	ENSURE_SMALL( product.cz.z - 1.0f, 1.0e-4f );
+	ENSURE_SMALL( product.cx.y, 1.0e-4f );
+	ENSURE_SMALL( product.cx.z, 1.0e-4f );
+	ENSURE_SMALL( product.cy.x, 1.0e-4f );
+	ENSURE_SMALL( product.cy.z, 1.0e-4f );
+	ENSURE_SMALL( product.cz.x, 1.0e-4f );
+	ENSURE_SMALL( product.cz.y, 1.0e-4f );
+
+	b3Quat q2 = b3MakeQuatFromAxisAngle( b3Normalize( (b3Vec3){ -1.0f, 0.2f, 0.4f } ), -2.1f );
+	b3Body_SetTransform( bodyId, b3Body_GetPosition( bodyId ), q2 );
+	r = b3MakeMatrixFromQuat( q2 );
+	world = b3MulMM( b3MulMM( r, local ), b3Transpose( r ) );
+	invWorld = b3Body_GetWorldInverseRotationalInertia( bodyId );
+	product = b3MulMM( invWorld, world );
+	ENSURE_SMALL( product.cx.x - 1.0f, 1.0e-4f );
+	ENSURE_SMALL( product.cy.y - 1.0f, 1.0e-4f );
+	ENSURE_SMALL( product.cz.z - 1.0f, 1.0e-4f );
+	ENSURE_SMALL( product.cy.x, 1.0e-4f );
+	ENSURE_SMALL( product.cz.y, 1.0e-4f );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+static b3BodyId CreateSpinningHullBody( b3WorldId worldId, float x, const b3HullData* hull )
+{
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position.x = x;
+	bodyDef.rotation = b3MakeQuatFromAxisAngle( b3Normalize( (b3Vec3){ 0.3f, -0.8f, 0.5f } ), 1.3f );
+	bodyDef.angularVelocity = (b3Vec3){ 1.0f, -2.0f, 3.0f };
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHullShape( bodyId, &shapeDef, hull );
+	return bodyId;
+}
+
+static bool HasGyroscopicTorque( b3BodyId bodyId )
+{
+	b3World* world = b3GetWorld( bodyId.world0 );
+	b3Body* body = b3GetBodyFullId( world, bodyId );
+	return ( body->flags & b3_enableGyroscopicTorque ) != 0;
+}
+
+// Bodies within the isotropic tolerance skip the gyroscopic solve, so in free flight the world
+// angular velocity is untouched. Anisotropic bodies precess.
+static int IsotropicInertiaTolerance( void )
+{
+	b3Vec3 w0 = { 1.0f, -2.0f, 3.0f };
+
+	b3HullData* rock = b3CreateRock( 0.5f );
+	b3HullData* complex = b3CreateComplexHull( 0.5f );
+	b3BoxHull cube = b3MakeCubeHull( 0.5f );
+	b3Transform cubeTransform = { b3Vec3_zero, b3MakeQuatFromAxisAngle( b3Normalize( (b3Vec3){ 1.0f, 2.0f, 3.0f } ), 0.7f ) };
+	b3BoxHull rotatedCube = b3MakeTransformedBoxHull( 0.5f, 0.5f, 0.5f, cubeTransform );
+	b3BoxHull plank = b3MakeBoxHull( 0.5f, 1.0f, 0.25f );
+
+	{
+		b3WorldDef worldDef = b3DefaultWorldDef();
+		worldDef.gravity = b3Vec3_zero;
+		b3WorldId worldId = b3CreateWorld( &worldDef );
+
+		b3BodyId rockId = CreateSpinningHullBody( worldId, 0.0f, rock );
+		b3BodyId complexId = CreateSpinningHullBody( worldId, 5.0f, complex );
+		b3BodyId cubeId = CreateSpinningHullBody( worldId, 10.0f, &cube.base );
+		b3BodyId rotatedCubeId = CreateSpinningHullBody( worldId, 15.0f, &rotatedCube.base );
+		b3BodyId plankId = CreateSpinningHullBody( worldId, 20.0f, &plank.base );
+
+		ENSURE( HasGyroscopicTorque( rockId ) == false );
+		ENSURE( HasGyroscopicTorque( complexId ) == false );
+		ENSURE( HasGyroscopicTorque( cubeId ) == false );
+		ENSURE( HasGyroscopicTorque( rotatedCubeId ) == false );
+		ENSURE( HasGyroscopicTorque( plankId ) );
+
+		for ( int i = 0; i < 10; ++i )
+		{
+			b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		}
+
+		b3Vec3 w = b3Body_GetAngularVelocity( rockId );
+		ENSURE( w.x == w0.x && w.y == w0.y && w.z == w0.z );
+		w = b3Body_GetAngularVelocity( complexId );
+		ENSURE( w.x == w0.x && w.y == w0.y && w.z == w0.z );
+		w = b3Body_GetAngularVelocity( rotatedCubeId );
+		ENSURE( w.x == w0.x && w.y == w0.y && w.z == w0.z );
+		w = b3Body_GetAngularVelocity( plankId );
+		ENSURE( b3Length( b3Sub( w, w0 ) ) > 0.01f );
+
+		b3Body_SetMotionLocks( plankId, (b3MotionLocks){ .angularX = true, .angularY = true, .angularZ = true } );
+		ENSURE( HasGyroscopicTorque( plankId ) == false );
+
+		// Gyroscopic torque stays off until a mass update proves the body anisotropic
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position.x = 25.0f;
+		bodyDef.angularVelocity = w0;
+		b3BodyId emptyId = b3CreateBody( worldId, &bodyDef );
+		ENSURE( HasGyroscopicTorque( emptyId ) == false );
+
+		bodyDef.position.x = 30.0f;
+		b3BodyId deferredId = b3CreateBody( worldId, &bodyDef );
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.updateBodyMass = false;
+		b3CreateHullShape( deferredId, &shapeDef, &plank.base );
+		ENSURE( HasGyroscopicTorque( deferredId ) == false );
+
+		b3Body_ApplyMassFromShapes( deferredId );
+		ENSURE( HasGyroscopicTorque( deferredId ) );
+
+		b3DestroyWorld( worldId );
+	}
+
+	{
+		b3WorldDef worldDef = b3DefaultWorldDef();
+		worldDef.gravity = b3Vec3_zero;
+		worldDef.isotropicInertiaTolerance = 0.0f;
+		b3WorldId worldId = b3CreateWorld( &worldDef );
+
+		b3BodyId rockId = CreateSpinningHullBody( worldId, 0.0f, rock );
+		b3BodyId cubeId = CreateSpinningHullBody( worldId, 10.0f, &cube.base );
+
+		ENSURE( HasGyroscopicTorque( rockId ) );
+		ENSURE( HasGyroscopicTorque( cubeId ) == false );
+
+		for ( int i = 0; i < 10; ++i )
+		{
+			b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		}
+
+		b3Vec3 w = b3Body_GetAngularVelocity( rockId );
+		ENSURE( b3Length( b3Sub( w, w0 ) ) > 0.001f );
+
+		b3DestroyWorld( worldId );
+	}
+
+	b3DestroyHull( rock );
+	b3DestroyHull( complex );
+	return 0;
+}
+
 int BodyTest( void )
 {
 	RUN_SUBTEST( FarSingleSphereMass );
@@ -395,5 +653,8 @@ int BodyTest( void )
 	RUN_SUBTEST( SetMassDataFixedRotation );
 	RUN_SUBTEST( SetMassDataZeroMass );
 	RUN_SUBTEST( SetMassDataConsistentVelocity );
+	RUN_SUBTEST( ShapeExtents );
+	RUN_SUBTEST( CompoundInertiaConsistency );
+	RUN_SUBTEST( IsotropicInertiaTolerance );
 	return 0;
 }

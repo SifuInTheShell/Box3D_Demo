@@ -8,7 +8,8 @@ wrapper vendored here in `extern/box3d-godot/godot/`.
 ## Where it came from, and the discipline
 
 - **Base fork:** [`Stink-O/box3d-godot`](https://github.com/Stink-O/box3d-godot)
-  at commit `a42bed6` (pinned in `extern/box3d-godot/UPSTREAM_COMMIT`). It
+  at commit `a42bed6`; the engine sources have since been synced directly from
+  `erincatto/box3d` (current pin in `extern/box3d-godot/UPSTREAM_COMMIT`). It
   exposed the core of Box3D — worlds, bodies, the shape types, the joint set,
   a character controller, basic queries and contact events — roughly a third
   of Box3D's ~420 public C functions.
@@ -30,7 +31,9 @@ wrapper vendored here in `extern/box3d-godot/godot/`.
 ## `Box3DWorld` — diagnostics, queries, determinism, solver knobs
 
 - **Live diagnostics** — `get_counters()`, `get_profile()`,
-  `get_awake_body_count()`, `get_bounds()`, `rebuild_static_tree()`.
+  `get_awake_body_count()`, `get_bounds()`, `rebuild_static_tree()` (upstream
+  made `b3World_RebuildStaticTree` internal in `79fc559`; the wrapper
+  forward-declares it, since the engine is linked into the same library).
 - **Queries** — `overlap_aabb(aabb, collision_mask)` (box-region query
   alongside the pre-existing sphere/ray casts).
 - **Deterministic recording → replay** — `start_recording(byte_capacity)`,

@@ -189,20 +189,61 @@ B3_INLINE float b3LerpFloat( float a, float b, float alpha )
 /// This is hand coded for cross-platform determinism. The atan2f
 /// function in the standard library is not cross-platform deterministic.
 ///	Accurate to around 0.0023 degrees.
-B3_API float b3Atan2( float y, float x );
+/// https://stackoverflow.com/questions/46210708/atan2-approximation-with-11bits-in-mantissa-on-x86with-sse2-and-armwith-vfpv4
+B3_INLINE float b3Atan2( float y, float x )
+{
+	// Added check for (0,0) to match atan2f and avoid NaN
+	if ( x == 0.0f && y == 0.0f )
+	{
+		return 0.0f;
+	}
+
+	float ax = b3AbsFloat( x );
+	float ay = b3AbsFloat( y );
+	float mx = b3MaxFloat( ay, ax );
+	float mn = b3MinFloat( ay, ax );
+	float a = mn / mx;
+
+	// Minimax polynomial approximation to atan(a) on [0,1]
+	float s = a * a;
+	float c = s * a;
+	float q = s * s;
+	float r = 0.024840285f * q + 0.18681418f;
+	float t = -0.094097948f * q - 0.33213072f;
+	r = r * s + t;
+	r = r * c + a;
+
+	// Map to full circle
+	if ( ay > ax )
+	{
+		r = 1.57079637f - r;
+	}
+
+	if ( x < 0 )
+	{
+		r = 3.14159274f - r;
+	}
+
+	if ( y < 0 )
+	{
+		r = -r;
+	}
+
+	return r;
+}
 
 /// Compute the cosine and sine of an angle in radians. Implemented
 /// for cross-platform determinism.
 B3_API b3CosSin b3ComputeCosSin( float radians );
 
-/// @deprecated 
+/// @deprecated
 B3_INLINE float b3Sin( float radians )
 {
 	b3CosSin cs = b3ComputeCosSin( radians );
 	return cs.sine;
 }
 
-/// @deprecated 
+/// @deprecated
 B3_INLINE float b3Cos( float radians )
 {
 	b3CosSin cs = b3ComputeCosSin( radians );
@@ -273,17 +314,15 @@ B3_INLINE float b3DistanceSquared( b3Vec3 a, b3Vec3 b )
 }
 
 /// Normalize a vector. Returns a zero vector if the input vector is very small.
-B3_INLINE b3Vec3 b3Normalize( b3Vec3 a )
+B3_FORCE_INLINE b3Vec3 b3Normalize( b3Vec3 a )
 {
 	float lengthSquared = a.x * a.x + a.y * a.y + a.z * a.z;
-
 	if ( lengthSquared > 1000.0f * FLT_MIN )
 	{
 		float s = 1.0f / sqrtf( lengthSquared );
 		b3Vec3 u = { s * a.x, s * a.y, s * a.z };
 		return u;
 	}
-
 	return B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
 }
 
@@ -291,15 +330,17 @@ B3_INLINE b3Vec3 b3Normalize( b3Vec3 a )
 /// if the input is very small.
 B3_INLINE b3Vec3 b3GetLengthAndNormalize( float* length, b3Vec3 a )
 {
-	*length = b3Length( a );
-	if ( *length < FLT_EPSILON )
+	float lengthSquared = a.x * a.x + a.y * a.y + a.z * a.z;
+	if ( lengthSquared > 1000.0f * FLT_MIN )
 	{
-		return b3Vec3_zero;
+		*length = sqrtf( lengthSquared );
+		float s = 1.0f / *length;
+		b3Vec3 u = { s * a.x, s * a.y, s * a.z };
+		return u;
 	}
 
-	float invLength = 1.0f / *length;
-	b3Vec3 n = { invLength * a.x, invLength * a.y, invLength * a.z };
-	return n;
+	*length = 0.0f;
+	return B3_LITERAL( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
 }
 
 /// Get a unit vector that is perpendicular to the supplied vector.
@@ -571,7 +612,7 @@ B3_INLINE float b3GetTwistAngle( b3Quat q )
 }
 
 /// Swing angle used for cone limit
-B3_INLINE float b3GetSwingAngle( b3Quat q )
+B3_FORCE_INLINE float b3GetSwingAngle( b3Quat q )
 {
 	// Polarity should not matter because all terms are squared.
 	float x = sqrtf( q.v.z * q.v.z + q.s * q.s );
@@ -629,7 +670,7 @@ B3_INLINE b3Transform b3InvertTransform( b3Transform t )
 }
 
 /// Transform a point.
-B3_INLINE b3Vec3 b3TransformPoint( b3Transform t, b3Vec3 v )
+B3_FORCE_INLINE b3Vec3 b3TransformPoint( b3Transform t, b3Vec3 v )
 {
 	b3Vec3 rv = b3RotateVector( t.q, v );
 	return b3Add( rv, t.p );
@@ -718,23 +759,23 @@ B3_INLINE b3Vec3 b3InvTransformWorldPoint( b3WorldTransform t, b3Pos p )
 	return b3InvRotateVector( t.q, d );
 }
 
-/// Relative transform of frame B in frame A. The narrow phase boundary.
-B3_INLINE b3Transform b3InvMulWorldTransforms( b3WorldTransform A, b3WorldTransform B )
-{
-	b3Transform C;
-	C.q = b3InvMulQuat( A.q, B.q );
-	b3Vec3 d = { (float)( B.p.x - A.p.x ), (float)( B.p.y - A.p.y ), (float)( B.p.z - A.p.z ) };
-	C.p = b3InvRotateVector( A.q, d );
-	return C;
-}
-
 /// Compose a world transform with a local transform.
-B3_INLINE b3WorldTransform b3MulWorldTransforms( b3WorldTransform A, b3Transform B )
+B3_FORCE_INLINE b3WorldTransform b3MulWorldTransforms( b3WorldTransform A, b3Transform B )
 {
 	b3WorldTransform C;
 	C.q = b3MulQuat( A.q, B.q );
 	b3Vec3 r = b3RotateVector( A.q, B.p );
 	C.p = B3_LITERAL( b3Pos ){ A.p.x + r.x, A.p.y + r.y, A.p.z + r.z };
+	return C;
+}
+
+/// Relative transform of frame B in frame A. The narrow phase boundary.
+B3_FORCE_INLINE b3Transform b3InvMulWorldTransforms( b3WorldTransform A, b3WorldTransform B )
+{
+	b3Transform C;
+	C.q = b3InvMulQuat( A.q, B.q );
+	b3Vec3 d = { (float)( B.p.x - A.p.x ), (float)( B.p.y - A.p.y ), (float)( B.p.z - A.p.z ) };
+	C.p = b3InvRotateVector( A.q, d );
 	return C;
 }
 
@@ -756,9 +797,10 @@ B3_INLINE b3WorldTransform b3MakeWorldTransform( b3Transform t )
 	return w;
 }
 
-/// Translate a local AABB by a world origin, rounding outward so the float box always contains
-/// the double box. Far from the origin a plain conversion could clip a shape out of its own box.
-/// In float mode the origin is float and the rounding is a no-op.
+/// Translate a local AABB by a world position, rounding outward so the single precision box
+/// encloses the double precision box. Far from the origin a plain conversion could clip a
+/// shape out of its own box.
+/// In single precision mode the the rounding is a no-op.
 B3_INLINE b3AABB b3OffsetAABB( b3AABB localBox, b3Pos origin )
 {
 	b3AABB out;
@@ -872,7 +914,7 @@ B3_INLINE b3Matrix3 b3InvertMatrix( b3Matrix3 m )
 
 /// Solve a matrix equation.
 /// @return inv(m) * a
-B3_INLINE b3Vec3 b3Solve3( b3Matrix3 m, b3Vec3 a )
+B3_FORCE_INLINE b3Vec3 b3Solve3( b3Matrix3 m, b3Vec3 a )
 {
 	float det = b3Det( m );
 	if ( b3AbsFloat( det ) > 1000.0f * FLT_MIN )
@@ -1037,7 +1079,7 @@ B3_INLINE bool b3AABB_Overlaps( b3AABB a, b3AABB b )
 /// Transform an axis-aligned bounding box. This can create a larger box
 /// than if you recomputed the AABB of the original shape with the transform
 /// applied.
-B3_INLINE b3AABB b3AABB_Transform( b3Transform transform, b3AABB a )
+B3_FORCE_INLINE b3AABB b3AABB_Transform( b3Transform transform, b3AABB a )
 {
 	b3Vec3 center = b3TransformPoint( transform, b3AABB_Center( a ) );
 	b3Matrix3 m = b3MakeMatrixFromQuat( transform.q );
@@ -1050,6 +1092,18 @@ B3_INLINE b3AABB b3AABB_Transform( b3Transform transform, b3AABB a )
 B3_INLINE b3Vec3 b3ClosestPointToAABB( b3Vec3 point, b3AABB a )
 {
 	return b3Clamp( point, a.lowerBound, a.upperBound );
+}
+
+/// One-dimensional mass-spring-damper simulation. Returns the new velocity given the position and
+/// time step. You can then compute the new position using:
+/// position += timeStep * newVelocity
+/// This drives towards a zero position. By using implicit integration we get a stable solution that
+/// doesn't require transcendental functions.
+B3_INLINE float b3SpringDamper( float hertz, float dampingRatio, float position, float velocity, float timeStep )
+{
+	float omega = 2.0f * B3_PI * hertz;
+	float omegaH = omega * timeStep;
+	return ( velocity - omega * omegaH * position ) / ( 1.0f + 2.0f * dampingRatio * omegaH + omegaH * omegaH );
 }
 
 /// The closest points between to segments or infinite lines.

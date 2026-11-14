@@ -3,6 +3,7 @@
 #pragma once
 
 #include "box3d/id.h"
+#include "box3d/math_functions.h"
 
 #include <stdbool.h>
 
@@ -23,7 +24,12 @@ void ResetGroundShapeId( void );
 void CreateTrees25( b3WorldId worldId );
 void CreateTrees50( b3WorldId worldId );
 void CreateTrees100( b3WorldId worldId );
+void CreateTrees25HeightField( b3WorldId worldId );
+void CreateTrees50HeightField( b3WorldId worldId );
+void CreateTrees100HeightField( b3WorldId worldId );
 void DestroyTrees( void );
+void CreateMeshDropBenchmark( b3WorldId worldId );
+void DestroyMeshDropBenchmark( void );
 void CreateJointGrid( b3WorldId worldId );
 void CreateJunkyard( b3WorldId worldId );
 void GetJunkyardCapacity( b3Capacity* capacity );
@@ -42,9 +48,40 @@ void GetWasherCapacity( b3Capacity* capacity );
 void CreateWasher( b3WorldId worldId );
 void CreateConvexPile( b3WorldId worldId );
 void GetConvexPileCapacity( b3Capacity* capacity );
+void GetSpinnerCapacity( b3Capacity* capacity );
+void CreateSpinner( b3WorldId worldId );
+void DestroySpinner( void );
+float GetSpinnerAngle( void );
+void GetSleepCapacity( b3Capacity* capacity );
+void CreateSleep( b3WorldId worldId );
+void StepSleep( b3WorldId worldId, int stepCount );
 
-// void CreateSpinner( b3WorldId worldId );
-// float StepSpinner( b3WorldId worldId, int stepCount );
+#define VILLAGE_STEP_COUNT 600
+
+typedef struct VillageCast
+{
+	b3Pos origin;
+	b3Pos point;
+	b3Vec3 normal;
+	float fraction;
+	bool hit;
+} VillageCast;
+
+// The sphere casts from the latest village step, for drawing
+typedef struct VillageCurtain
+{
+	const VillageCast* casts;
+	int castCount;
+	b3Vec3 translation;
+	float radius;
+} VillageCurtain;
+
+void GetVillageCapacity( b3Capacity* capacity );
+void CreateVillage( b3WorldId worldId );
+void StepVillage( b3WorldId worldId, int stepIndex );
+void DestroyVillage( void );
+VillageCurtain GetVillageCurtain( void );
+
 // void CreateSmash( b3WorldId worldId );
 // void CreateTumbler( b3WorldId worldId );
 

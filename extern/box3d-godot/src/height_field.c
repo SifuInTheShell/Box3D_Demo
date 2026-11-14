@@ -99,6 +99,53 @@
 	   21  3  22
  */
 
+static b3Vec3 b3GetGridPoint( const float* heights, int columnCount, b3Vec3 scale, int row, int column )
+{
+	return b3Mul( scale, (b3Vec3){ (float)column, heights[row * columnCount + column], (float)row } );
+}
+
+static b3Vec3 b3GetGridTriangleNormal( const float* heights, int columnCount, b3Vec3 scale, int row, int column, bool odd )
+{
+	b3Vec3 point11 = b3GetGridPoint( heights, columnCount, scale, row, column );
+	b3Vec3 point12 = b3GetGridPoint( heights, columnCount, scale, row, column + 1 );
+	b3Vec3 point21 = b3GetGridPoint( heights, columnCount, scale, row + 1, column );
+	b3Vec3 point22 = b3GetGridPoint( heights, columnCount, scale, row + 1, column + 1 );
+
+	b3Vec3 v1 = odd ? point22 : point11;
+	b3Vec3 v2 = odd ? point12 : point21;
+	b3Vec3 v3 = odd ? point21 : point12;
+	return b3Normalize( b3Cross( b3Sub( v2, v1 ), b3Sub( v3, v1 ) ) );
+}
+
+// Mark vertices as flat or concave.
+static void b3MarkGridEdge( uint8_t* vertexFlags, int index1, int index2, b3Vec3 point1, b3Vec3 point2, b3Vec3 normal1,
+							b3Vec3 normal2, bool clockwise )
+{
+	b3Vec3 outward = b3Cross( b3Normalize( b3Sub( point2, point1 ) ), normal1 );
+	float angle = b3Atan2( b3Dot( normal2, outward ), b3Dot( normal2, normal1 ) );
+
+	// Quantize to match the mesh rule.
+	int8_t quantized = b3QuantizeEdgeAngle( clockwise ? -angle : angle );
+
+	if ( quantized != 0 )
+	{
+		vertexFlags[index1] = (uint8_t)( vertexFlags[index1] & ~b3_flatVertex );
+		vertexFlags[index2] = (uint8_t)( vertexFlags[index2] & ~b3_flatVertex );
+	}
+
+	if ( quantized < 0 )
+	{
+		vertexFlags[index1] |= b3_concaveVertex;
+		vertexFlags[index2] |= b3_concaveVertex;
+	}
+}
+
+static void b3MarkGridBoundary( uint8_t* vertexFlags, int index1, int index2 )
+{
+	vertexFlags[index1] = (uint8_t)( vertexFlags[index1] & ~b3_flatVertex );
+	vertexFlags[index2] = (uint8_t)( vertexFlags[index2] & ~b3_flatVertex );
+}
+
 b3HeightFieldData* b3CreateHeightField( const b3HeightFieldDef* data )
 {
 	int columnCount = data->countX;
@@ -119,6 +166,8 @@ b3HeightFieldData* b3CreateHeightField( const b3HeightFieldDef* data )
 	byteCount += b3AlignUp8( cellCount * sizeof( uint8_t ) );
 	int flagsOffset = (int)byteCount;
 	byteCount += b3AlignUp8( triangleCount * sizeof( uint8_t ) );
+	int vertexFlagOffset = (int)byteCount;
+	byteCount += b3AlignUp8( (size_t)( ( heightCount + 7 ) / 8 ) );
 
 	// Zero the whole blob so alignment padding is defined. The construction-time hash
 	// sweeps raw bytes and would otherwise pick up uninitialized padding.
@@ -133,6 +182,7 @@ b3HeightFieldData* b3CreateHeightField( const b3HeightFieldDef* data )
 	hf->heightsOffset = heightsOffset;
 	hf->materialOffset = materialOffset;
 	hf->flagsOffset = flagsOffset;
+	hf->vertexFlagOffset = vertexFlagOffset;
 	hf->clockwise = data->clockwiseWinding;
 
 	uint16_t* compressedHeights = (uint16_t*)( (intptr_t)hf + heightsOffset );
@@ -466,17 +516,86 @@ b3HeightFieldData* b3CreateHeightField( const b3HeightFieldDef* data )
 
 	B3_ASSERT( triangleIndex == triangleCount );
 
+	// b3MeshVertexFlags
+	uint8_t* vertexFlags = (uint8_t*)b3Alloc( heightCount * sizeof( uint8_t ) );
+	memset( vertexFlags, b3_flatVertex, heightCount * sizeof( uint8_t ) );
+
+	bool clockwise = hf->clockwise != 0;
+	int cellColumnCount = columnCount - 1;
+	int cellRowCount = rowCount - 1;
+
+	for ( int row = 0; row < rowCount; ++row )
+	{
+		for ( int column = 0; column < columnCount; ++column )
+		{
+			int index = row * columnCount + column;
+			b3Vec3 point = b3GetGridPoint( heights, columnCount, scale, row, column );
+
+			if ( column < cellColumnCount )
+			{
+				bool below = row < cellRowCount && materialIndices[row * cellColumnCount + column] != B3_HEIGHT_FIELD_HOLE;
+				bool above =
+					row > 0 && materialIndices[( row - 1 ) * cellColumnCount + column] != B3_HEIGHT_FIELD_HOLE;
+				if ( below && above )
+				{
+					b3Vec3 next = b3GetGridPoint( heights, columnCount, scale, row, column + 1 );
+					b3Vec3 normal1 = b3GetGridTriangleNormal( heights, columnCount, scale, row, column, false );
+					b3Vec3 normal2 = b3GetGridTriangleNormal( heights, columnCount, scale, row - 1, column, true );
+					b3MarkGridEdge( vertexFlags, index + 1, index, next, point, normal1, normal2, clockwise );
+				}
+				else if ( below || above )
+				{
+					b3MarkGridBoundary( vertexFlags, index, index + 1 );
+				}
+			}
+
+			if ( row < cellRowCount )
+			{
+				bool right =
+					column < cellColumnCount && materialIndices[row * cellColumnCount + column] != B3_HEIGHT_FIELD_HOLE;
+				bool left = column > 0 && materialIndices[row * cellColumnCount + column - 1] != B3_HEIGHT_FIELD_HOLE;
+				if ( right && left )
+				{
+					b3Vec3 next = b3GetGridPoint( heights, columnCount, scale, row + 1, column );
+					b3Vec3 normal1 = b3GetGridTriangleNormal( heights, columnCount, scale, row, column, false );
+					b3Vec3 normal2 = b3GetGridTriangleNormal( heights, columnCount, scale, row, column - 1, true );
+					b3MarkGridEdge( vertexFlags, index, index + columnCount, point, next, normal1, normal2, clockwise );
+				}
+				else if ( right || left )
+				{
+					b3MarkGridBoundary( vertexFlags, index, index + columnCount );
+				}
+			}
+
+			if ( row < cellRowCount && column < cellColumnCount &&
+				 materialIndices[row * cellColumnCount + column] != B3_HEIGHT_FIELD_HOLE )
+			{
+				b3Vec3 point21 = b3GetGridPoint( heights, columnCount, scale, row + 1, column );
+				b3Vec3 point12 = b3GetGridPoint( heights, columnCount, scale, row, column + 1 );
+				b3Vec3 normal1 = b3GetGridTriangleNormal( heights, columnCount, scale, row, column, false );
+				b3Vec3 normal2 = b3GetGridTriangleNormal( heights, columnCount, scale, row, column, true );
+				b3MarkGridEdge( vertexFlags, index + columnCount, index + 1, point21, point12, normal1, normal2, clockwise );
+			}
+		}
+	}
+
+	uint8_t* vertexBits = (uint8_t*)( (intptr_t)hf + vertexFlagOffset );
+	for ( int i = 0; i < heightCount; ++i )
+	{
+		if ( vertexFlags[i] == 0 )
+		{
+			vertexBits[i >> 3] |= (uint8_t)( 1 << ( i & 7 ) );
+		}
+	}
+
+	b3Free( vertexFlags, heightCount * sizeof( uint8_t ) );
 	b3Free( decompressedHeights, heightCount * sizeof( float ) );
 
-	// Content hash over the whole blob with the hash field zeroed, like b3HullData/b3MeshData.
 	hf->hash = 0;
-	hf->hash = b3NonZeroHash( b3Hash( B3_HASH_INIT, (const uint8_t*)hf, hf->byteCount ) );
+	hf->hash = b3Hash64NonZero( (const uint8_t*)hf, hf->byteCount );
 
 	return hf;
 }
-
-_Static_assert( b3_concaveEdge3 == 4 * b3_concaveEdge1, "bit math" );
-_Static_assert( b3_inverseConcaveEdge3 == 4 * b3_inverseConcaveEdge1, "bit math" );
 
 // Decode the four corner vertices of a height field cell into local space.
 // Output order matches the index naming used throughout this file:
@@ -519,8 +638,6 @@ b3Triangle b3GetHeightFieldTriangle( const b3HeightFieldData* heightField, int t
 	B3_ASSERT( triangleIndex < 2 * ( heightField->columnCount - 1 ) * ( heightField->rowCount - 1 ) );
 
 	b3Triangle triangle;
-	triangle.flags = b3GetHeightFieldFlags( heightField )[triangleIndex];
-
 	int columnCount = heightField->columnCount;
 	int quadIndex = triangleIndex >> 1;
 	int row = quadIndex / ( columnCount - 1 );
@@ -563,15 +680,6 @@ b3Triangle b3GetHeightFieldTriangle( const b3HeightFieldData* heightField, int t
 	{
 		B3_SWAP( triangle.vertices[1], triangle.vertices[2] );
 		B3_SWAP( triangle.i2, triangle.i3 );
-
-		// Reversing winding swaps edge1 and edge3; edge2 (the diagonal) is preserved.
-		int flags = triangle.flags;
-		int edge1Bits = flags & ( b3_concaveEdge1 | b3_inverseConcaveEdge1 );
-		int edge3Bits = flags & ( b3_concaveEdge3 | b3_inverseConcaveEdge3 );
-		flags &= ~( b3_concaveEdge1 | b3_concaveEdge3 | b3_inverseConcaveEdge1 | b3_inverseConcaveEdge3 );
-		flags |= edge1Bits << 2;
-		flags |= edge3Bits >> 2;
-		triangle.flags = flags;
 	}
 
 	return triangle;
@@ -584,6 +692,124 @@ int b3GetHeightFieldMaterial( const b3HeightFieldData* heightField, int triangle
 
 	int cellIndex = triangleIndex >> 1;
 	return b3GetHeightFieldMaterialIndices( heightField )[cellIndex];
+}
+
+bool b3GetHeightFieldNeighborNormal( const b3HeightFieldData* heightField, int triangleIndex, int edgeIndex, b3Vec3* normal )
+{
+	B3_ASSERT( 0 <= triangleIndex && triangleIndex < b3GetHeightFieldTriangleCount( heightField ) );
+	B3_ASSERT( 0 <= edgeIndex && edgeIndex < 3 );
+
+	if ( heightField->clockwise )
+	{
+		// Reflected
+		edgeIndex = 2 - edgeIndex;
+	}
+
+	int cellColumnCount = heightField->columnCount - 1;
+	int cellRowCount = heightField->rowCount - 1;
+	int cellIndex = triangleIndex >> 1;
+	int row = cellIndex / cellColumnCount;
+	int column = cellIndex - row * cellColumnCount;
+	bool odd = ( triangleIndex & 1 ) == 1;
+
+	// Get the row and column for the neighbor cell.
+	if ( edgeIndex == 0 )
+	{
+		column += odd ? 1 : -1;
+	}
+	else if ( edgeIndex == 2 )
+	{
+		row += odd ? 1 : -1;
+	}
+
+	if ( row < 0 || row >= cellRowCount || column < 0 || column >= cellColumnCount )
+	{
+		return false;
+	}
+
+	int neighborCell = row * cellColumnCount + column;
+
+	const uint8_t* materialIndices = b3GetHeightFieldMaterialIndices( heightField );
+	if ( materialIndices[neighborCell] == B3_HEIGHT_FIELD_HOLE )
+	{
+		return false;
+	}
+
+	b3Triangle neighbor = b3GetHeightFieldTriangle( heightField, 2 * neighborCell + ( odd ? 0 : 1 ) );
+	b3Vec3 e1 = b3Sub( neighbor.vertices[1], neighbor.vertices[0] );
+	b3Vec3 e2 = b3Sub( neighbor.vertices[2], neighbor.vertices[0] );
+	*normal = b3Normalize( b3Cross( e1, e2 ) );
+	return true;
+}
+
+bool b3IsHeightFieldVertexConvex( const b3HeightFieldData* heightField, int triangleIndex, int vertexIndex )
+{
+	B3_ASSERT( 0 <= triangleIndex && triangleIndex < b3GetHeightFieldTriangleCount( heightField ) );
+	B3_ASSERT( 0 <= vertexIndex && vertexIndex < 3 );
+
+	if ( heightField->vertexFlagOffset == 0 )
+	{
+		return false;
+	}
+
+	if ( heightField->clockwise )
+	{
+		vertexIndex = ( 3 - vertexIndex ) % 3;
+	}
+
+	int columnCount = heightField->columnCount;
+	int cellIndex = triangleIndex >> 1;
+	int row = cellIndex / ( columnCount - 1 );
+	int column = cellIndex - row * ( columnCount - 1 );
+
+	int offsets[2][3] = {
+		{ 0, columnCount, 1 },
+		{ columnCount + 1, 1, columnCount },
+	};
+
+	int index = row * columnCount + column + offsets[triangleIndex & 1][vertexIndex];
+	const uint8_t* vertexBits = (const uint8_t*)( (intptr_t)heightField + heightField->vertexFlagOffset );
+	return ( vertexBits[index >> 3] & ( 1 << ( index & 7 ) ) ) != 0;
+}
+
+int b3GetHeightFieldVertexTriangles( const b3HeightFieldData* heightField, int vertex, int triangles[6] )
+{
+	int columnCount = heightField->columnCount;
+	int cellColumnCount = columnCount - 1;
+	int cellRowCount = heightField->rowCount - 1;
+	int row = vertex / columnCount;
+	int column = vertex - row * columnCount;
+
+	int rowOffsets[4] = { 0, 0, -1, -1 };
+	int columnOffsets[4] = { 0, -1, 0, -1 };
+	int firstParity[4] = { 0, 0, 0, 1 };
+	int lastParity[4] = { 0, 1, 1, 1 };
+
+	const uint8_t* materialIndices = b3GetHeightFieldMaterialIndices( heightField );
+	int count = 0;
+	for ( int i = 0; i < 4; ++i )
+	{
+		int cellRow = row + rowOffsets[i];
+		int cellColumn = column + columnOffsets[i];
+		if ( cellRow < 0 || cellRow >= cellRowCount || cellColumn < 0 || cellColumn >= cellColumnCount )
+		{
+			continue;
+		}
+
+		int cellIndex = cellRow * cellColumnCount + cellColumn;
+		if ( materialIndices[cellIndex] == B3_HEIGHT_FIELD_HOLE )
+		{
+			continue;
+		}
+
+		for ( int parity = firstParity[i]; parity <= lastParity[i]; ++parity )
+		{
+			triangles[count] = 2 * cellIndex + parity;
+			count += 1;
+		}
+	}
+
+	return count;
 }
 
 b3AABB b3ComputeHeightFieldAABB( const b3HeightFieldData* shape, b3Transform transform )
@@ -609,6 +835,7 @@ b3CastOutput b3ShapeCastHeightField( const b3HeightFieldData* heightField, const
 	b3Vec3 shapeTranslation = input->translation;
 	b3Vec3 scale = heightField->scale;
 
+	// The shape start is the center of the proxy.
 	b3Vec3 shapeStart = b3AABB_Center( shapeBounds );
 	b3Vec3 shapeDelta = b3MulSV( input->maxFraction, shapeTranslation );
 	b3Vec3 shapeEnd = b3Add( shapeStart, shapeDelta );
@@ -769,8 +996,11 @@ b3CastOutput b3ShapeCastHeightField( const b3HeightFieldData* heightField, const
 	castBounds.lowerBound = b3Sub( b3Min( centerStart, centerEnd ), shapeExtents );
 	castBounds.upperBound = b3Add( b3Max( centerStart, centerEnd ), shapeExtents );
 
+	// The ray origin is the center of the shape.
 	b3V32 rayOrigin = b3LoadV( &shapeStart.x );
 	b3V32 rayTranslation = b3LoadV( &shapeTranslation.x );
+
+	bool clockwise = heightField->clockwise;
 
 	while ( true )
 	{
@@ -828,6 +1058,11 @@ b3CastOutput b3ShapeCastHeightField( const b3HeightFieldData* heightField, const
 				b3Vec3 point21 = corners[2];
 				b3Vec3 point22 = corners[3];
 
+				if ( clockwise )
+				{
+					B3_SWAP( point12, point21 );
+				}
+
 				// I know the min/max x and z values, but not the min/max heights.
 				b3AABB bounds;
 				bounds.lowerBound = b3Min( b3Min( point11, point12 ), b3Min( point21, point22 ) );
@@ -847,18 +1082,8 @@ b3CastOutput b3ShapeCastHeightField( const b3HeightFieldData* heightField, const
 					// Ray cast
 					{
 						b3V32 vertex1 = b3LoadV( &point11.x );
-						b3V32 vertex2, vertex3;
-
-						if ( heightField->clockwise )
-						{
-							vertex2 = b3LoadV( &point12.x );
-							vertex3 = b3LoadV( &point21.x );
-						}
-						else
-						{
-							vertex2 = b3LoadV( &point21.x );
-							vertex3 = b3LoadV( &point12.x );
-						}
+						b3V32 vertex2 = b3LoadV( &point21.x );
+						b3V32 vertex3 = b3LoadV( &point12.x );
 
 						float alpha = b3IntersectRayTriangle( rayOrigin, rayTranslation, vertex1, vertex2, vertex3 );
 						B3_ASSERT( 0 <= alpha && alpha <= 1.0f );
@@ -867,7 +1092,7 @@ b3CastOutput b3ShapeCastHeightField( const b3HeightFieldData* heightField, const
 						{
 							b3Vec3 edge1 = b3Sub( point21, point11 );
 							b3Vec3 edge2 = b3Sub( point12, point11 );
-							b3Vec3 normal = heightField->clockwise ? b3Cross( edge2, edge1 ) : b3Cross( edge1, edge2 );
+							b3Vec3 normal = b3Cross( edge1, edge2 );
 
 							result.point = b3MulAdd( shapeStart, alpha, shapeTranslation );
 							result.normal = b3Normalize( normal );
@@ -881,18 +1106,8 @@ b3CastOutput b3ShapeCastHeightField( const b3HeightFieldData* heightField, const
 
 					{
 						b3V32 vertex1 = b3LoadV( &point22.x );
-						b3V32 vertex2, vertex3;
-
-						if ( heightField->clockwise )
-						{
-							vertex2 = b3LoadV( &point21.x );
-							vertex3 = b3LoadV( &point12.x );
-						}
-						else
-						{
-							vertex2 = b3LoadV( &point12.x );
-							vertex3 = b3LoadV( &point21.x );
-						}
+						b3V32 vertex2 = b3LoadV( &point12.x );
+						b3V32 vertex3 = b3LoadV( &point21.x );
 
 						float alpha = b3IntersectRayTriangle( rayOrigin, rayTranslation, vertex1, vertex2, vertex3 );
 						B3_ASSERT( 0 <= alpha && alpha <= 1.0f );
@@ -901,7 +1116,7 @@ b3CastOutput b3ShapeCastHeightField( const b3HeightFieldData* heightField, const
 						{
 							b3Vec3 edge1 = b3Sub( point22, point21 );
 							b3Vec3 edge2 = b3Sub( point12, point21 );
-							b3Vec3 normal = heightField->clockwise ? b3Cross( edge2, edge1 ) : b3Cross( edge1, edge2 );
+							b3Vec3 normal = b3Cross( edge1, edge2 );
 
 							result.point = b3MulAdd( shapeStart, alpha, shapeTranslation );
 							result.normal = b3Normalize( normal );
@@ -916,44 +1131,55 @@ b3CastOutput b3ShapeCastHeightField( const b3HeightFieldData* heightField, const
 				else
 				{
 					// Shape cast
-					// todo back-side culling
 					{
-						// Shift origin to first vertex
-						b3Vec3 origin = point11;
-						b3Vec3 triangleVertices[] = { b3Vec3_zero, b3Sub( point21, origin ), b3Sub( point12, origin ) };
-						pairInput.proxyA = (b3ShapeProxy){ triangleVertices, 3, 0.0f };
-						pairInput.maxFraction = bestFraction;
-						pairInput.transform.p = b3Neg( origin );
+						// shapeStart is the center of the proxy.
+						float signedVolume = b3SignedVolume( point11, point21, point12, shapeStart );
 
-						b3CastOutput pairOutput = b3ShapeCast( &pairInput );
-
-						if ( pairOutput.hit )
+						if ( signedVolume >= 0.0f )
 						{
-							bestFraction = pairOutput.fraction;
-							result = pairOutput;
-							result.point = b3Add( result.point, origin );
-							result.triangleIndex = triangleIndex1;
-							result.materialIndex = materialIndex;
+							// Shift origin to first vertex
+							b3Vec3 origin = point11;
+							b3Vec3 triangleVertices[] = { b3Vec3_zero, b3Sub( point21, origin ), b3Sub( point12, origin ) };
+							pairInput.proxyA = (b3ShapeProxy){ triangleVertices, 3, 0.0f };
+							pairInput.maxFraction = bestFraction;
+							pairInput.transform.p = b3Neg( origin );
+
+							b3CastOutput pairOutput = b3ShapeCast( &pairInput );
+
+							if ( pairOutput.hit )
+							{
+								bestFraction = pairOutput.fraction;
+								result = pairOutput;
+								result.point = b3Add( result.point, origin );
+								result.triangleIndex = triangleIndex1;
+								result.materialIndex = materialIndex;
+							}
 						}
 					}
 
 					{
-						// Shift origin to first vertex
-						b3Vec3 origin = point21;
-						b3Vec3 triangleVertices[] = { b3Vec3_zero, b3Sub( point22, origin ), b3Sub( point12, origin ) };
-						pairInput.proxyA = (b3ShapeProxy){ triangleVertices, 3, 0.0f };
-						pairInput.maxFraction = bestFraction;
-						pairInput.transform.p = b3Neg( origin );
+						// shapeStart is the center of the proxy.
+						float signedVolume = b3SignedVolume( point21, point22, point12, shapeStart );
 
-						b3CastOutput pairOutput = b3ShapeCast( &pairInput );
-
-						if ( pairOutput.hit )
+						if ( signedVolume >= 0.0f )
 						{
-							bestFraction = pairOutput.fraction;
-							result = pairOutput;
-							result.point = b3Add( result.point, origin );
-							result.triangleIndex = triangleIndex2;
-							result.materialIndex = materialIndex;
+							// Shift origin to first vertex
+							b3Vec3 origin = point21;
+							b3Vec3 triangleVertices[] = { b3Vec3_zero, b3Sub( point22, origin ), b3Sub( point12, origin ) };
+							pairInput.proxyA = (b3ShapeProxy){ triangleVertices, 3, 0.0f };
+							pairInput.maxFraction = bestFraction;
+							pairInput.transform.p = b3Neg( origin );
+
+							b3CastOutput pairOutput = b3ShapeCast( &pairInput );
+
+							if ( pairOutput.hit )
+							{
+								bestFraction = pairOutput.fraction;
+								result = pairOutput;
+								result.point = b3Add( result.point, origin );
+								result.triangleIndex = triangleIndex2;
+								result.materialIndex = materialIndex;
+							}
 						}
 					}
 				}
@@ -1056,8 +1282,7 @@ bool b3OverlapHeightField( const b3HeightFieldData* shape, b3Transform shapeTran
 
 	b3SimplexCache cache = { 0 };
 
-	// Outer loop on rows and inner loop on columns so that triangle indices
-	// increase monotonically.
+	// Outer loop on rows and inner loop on columns so that triangle indices increase monotonically.
 	for ( int row = minRow; row <= maxRow; ++row )
 	{
 		if ( row < 0 || shape->rowCount - 1 <= row )
@@ -1211,6 +1436,7 @@ int b3CollideMoverAndHeightField( b3PlaneResult* planes, int capacity, const b3H
 	b3SimplexCache cache = { 0 };
 
 	float radius = mover->radius;
+	b3Vec3 center = b3Lerp( mover->center1, mover->center2, 0.5f );
 	b3V32 center1 = b3LoadV( &mover->center1.x );
 	b3V32 center2 = b3LoadV( &mover->center2.x );
 	b3V32 r = b3SplatV( radius );
@@ -1229,6 +1455,8 @@ int b3CollideMoverAndHeightField( b3PlaneResult* planes, int capacity, const b3H
 	int maxRow = (int)floorf( localMaxZ / scale.z );
 	int minCol = (int)floorf( localMinX / scale.x );
 	int maxCol = (int)floorf( localMaxX / scale.x );
+
+	bool clockWise = shape->clockwise;
 
 	int planeCount = 0;
 
@@ -1263,63 +1491,84 @@ int b3CollideMoverAndHeightField( b3PlaneResult* planes, int capacity, const b3H
 			b3Vec3 point21 = corners[2];
 			b3Vec3 point22 = corners[3];
 
+			if ( clockWise )
+			{
+				B3_SWAP( point12, point21 );
+			}
+
 			b3V32 v11 = b3LoadV( &point11.x );
 			b3V32 v12 = b3LoadV( &point12.x );
 			b3V32 v21 = b3LoadV( &point21.x );
 			b3V32 v22 = b3LoadV( &point22.x );
 
-			if ( b3TestBoundsTriangleOverlap( boundsCenter, boundsExtent, v11, v21, v12 ) )
+			bool overlap1 = b3TestBoundsTriangleOverlap( boundsCenter, boundsExtent, v11, v21, v12 );
+			if ( overlap1 )
 			{
-				b3Vec3 triangleVertices[] = { point11, point21, point12 };
-				distanceInput.proxyA = (b3ShapeProxy){ triangleVertices, 3, 0.0f };
+				float signedVolume = b3SignedVolume( point11, point21, point12, center );
 
-				// reset the cache
-				cache.count = 0;
-
-				// get distance between triangle and mover
-				b3DistanceOutput distanceOutput = b3ShapeDistance( &distanceInput, &cache, NULL, 0 );
-
-				if ( distanceOutput.distance == 0.0f )
+				// Front side?
+				if ( signedVolume >= 0.0f )
 				{
-					// todo SAT
-				}
-				else if ( distanceOutput.distance <= mover->radius )
-				{
-					b3Plane plane = { distanceOutput.normal, mover->radius - distanceOutput.distance };
-					planes[planeCount] = (b3PlaneResult){ plane, distanceOutput.pointA };
-					planeCount += 1;
+					b3Vec3 triangleVertices[] = { point11, point21, point12 };
+					distanceInput.proxyA = (b3ShapeProxy){ triangleVertices, 3, 0.0f };
 
-					if ( planeCount == capacity )
+					// reset the cache
+					cache.count = 0;
+
+					// get distance between triangle and mover
+					b3DistanceOutput distanceOutput = b3ShapeDistance( &distanceInput, &cache, NULL, 0 );
+
+					if ( distanceOutput.distance == 0.0f )
 					{
-						return planeCount;
+						// deep overlap
+					}
+					else if ( distanceOutput.distance <= mover->radius )
+					{
+						int triangleIndex = 2 * cellIndex;
+						b3Plane plane = { distanceOutput.normal, mover->radius - distanceOutput.distance };
+						planes[planeCount] = (b3PlaneResult){ plane, distanceOutput.pointA, triangleIndex, 0, material };
+						planeCount += 1;
+
+						if ( planeCount == capacity )
+						{
+							return planeCount;
+						}
 					}
 				}
 			}
 
-			if ( b3TestBoundsTriangleOverlap( boundsCenter, boundsExtent, v21, v22, v12 ) )
+			bool overlap2 = b3TestBoundsTriangleOverlap( boundsCenter, boundsExtent, v21, v22, v12 );
+			if ( overlap2 )
 			{
-				b3Vec3 triangleVertices[] = { point22, point12, point21 };
-				distanceInput.proxyA = (b3ShapeProxy){ triangleVertices, 3, 0.0f };
+				float signedVolume = b3SignedVolume( point22, point12, point21, center );
 
-				// reset the cache
-				cache.count = 0;
-
-				// get distance between triangle and mover
-				b3DistanceOutput distanceOutput = b3ShapeDistance( &distanceInput, &cache, NULL, 0 );
-
-				if ( distanceOutput.distance == 0.0f )
+				// Front side?
+				if ( signedVolume >= 0.0f )
 				{
-					// todo SAT
-				}
-				else if ( distanceOutput.distance <= mover->radius )
-				{
-					b3Plane plane = { distanceOutput.normal, mover->radius - distanceOutput.distance };
-					planes[planeCount] = (b3PlaneResult){ plane, distanceOutput.pointA };
-					planeCount += 1;
+					b3Vec3 triangleVertices[] = { point22, point12, point21 };
+					distanceInput.proxyA = (b3ShapeProxy){ triangleVertices, 3, 0.0f };
 
-					if ( planeCount == capacity )
+					// reset the cache
+					cache.count = 0;
+
+					// get distance between triangle and mover
+					b3DistanceOutput distanceOutput = b3ShapeDistance( &distanceInput, &cache, NULL, 0 );
+
+					if ( distanceOutput.distance == 0.0f )
 					{
-						return planeCount;
+						// deep overlap
+					}
+					else if ( distanceOutput.distance <= mover->radius )
+					{
+						int triangleIndex = 2 * cellIndex + 1;
+						b3Plane plane = { distanceOutput.normal, mover->radius - distanceOutput.distance };
+						planes[planeCount] = (b3PlaneResult){ plane, distanceOutput.pointA, triangleIndex, 0, material };
+						planeCount += 1;
+
+						if ( planeCount == capacity )
+						{
+							return planeCount;
+						}
 					}
 				}
 			}

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "container.h"
 #include "core.h"
 
 #include "box3d/id.h"
@@ -46,14 +47,14 @@ typedef struct b3World b3World;
 #define B3_REC_MAGIC 0x43523342u
 
 // Major recording version is bumped when writers change.
-// Major version 4 added b3ShapeDef::enableSpeculativeContact
-#define B3_REC_VERSION_MAJOR 4
+// Major version 6 widened the body def with the safety factor.
+#define B3_REC_VERSION_MAJOR 6
 
 // Minor tracks op-stream additions that keep the 48 byte header shape.
-// Minor version 3 added name cache.
-#define B3_REC_VERSION_MINOR 3
+// Minor version 7 made the contact body sim locators persistent
+#define B3_REC_VERSION_MINOR 10
 
-// File header, fixed 48 bytes, little-endian. Contains the registry locator so the player
+// File header, fixed 48 bytes. Contains the registry locator so the player
 // can load geometry before replaying any ops.
 typedef struct b3RecHeader
 {
@@ -106,13 +107,13 @@ typedef struct b3GeometryEntry
 	int hashNext;
 } b3GeometryEntry;
 
+b3DeclareArray( b3GeometryEntry );
+
 // Growable array of geometry entries. Ids are array indices, so the array is serialized in order.
 // dedupMap maps content hash to entry id for O(1) dedup; it is opaque here and owned by recording.c.
 typedef struct b3GeometryRegistry
 {
-	b3GeometryEntry* entries;
-	int count;
-	int capacity;
+	b3Array( b3GeometryEntry ) entries;
 	void* dedupMap;
 } b3GeometryRegistry;
 
@@ -126,7 +127,7 @@ typedef struct b3GeometryRegistry
 typedef struct b3RecTag
 {
 	// hash of (id, queryName)
-	uint64_t key;				  
+	uint64_t key;
 	uint64_t id;
 	char queryName[B3_MAX_QUERY_NAME_LENGTH + 1];
 } b3RecTag;
@@ -195,6 +196,8 @@ typedef b3RevoluteJointDef b3RecCType_REVOLUTEJOINTDEF;
 typedef b3SphericalJointDef b3RecCType_SPHERICALJOINTDEF;
 typedef b3WeldJointDef b3RecCType_WELDJOINTDEF;
 typedef b3WheelJointDef b3RecCType_WHEELJOINTDEF;
+typedef b3MoverJointDef b3RecCType_MOVERJOINTDEF;
+typedef b3PogoJointDef b3RecCType_POGOJOINTDEF;
 
 // Codegen pass 1a: arg structs. Generated here so call sites (body.c, shape.c, etc.) can see them.
 #define ARG( TAG, field ) b3RecCType_##TAG field;
@@ -265,6 +268,8 @@ void b3RecW_REVOLUTEJOINTDEF( b3RecBuffer* buf, b3RevoluteJointDef v );
 void b3RecW_SPHERICALJOINTDEF( b3RecBuffer* buf, b3SphericalJointDef v );
 void b3RecW_WELDJOINTDEF( b3RecBuffer* buf, b3WeldJointDef v );
 void b3RecW_WHEELJOINTDEF( b3RecBuffer* buf, b3WheelJointDef v );
+void b3RecW_MOVERJOINTDEF( b3RecBuffer* buf, b3MoverJointDef v );
+void b3RecW_POGOJOINTDEF( b3RecBuffer* buf, b3PogoJointDef v );
 
 // Record framing
 void b3RecBeginRecord( b3Recording* rec, uint8_t opcode );
@@ -350,11 +355,11 @@ float b3RecCastTrampoline( b3ShapeId id, b3Pos point, b3Vec3 normal, float fract
 bool b3RecPlaneTrampoline( b3ShapeId id, const b3PlaneResult* planes, int planeCount, void* ctx );
 
 // Geometry registry
-uint32_t b3InternGeometry( b3GeometryRegistry* reg, b3GeometryKind kind, uint64_t contentHash, uint8_t* bytes, int byteCount );
+uint32_t b3InternGeometry( b3GeometryRegistry* reg, b3GeometryKind kind, uint64_t contentHash, const uint8_t* bytes, int byteCount );
 // Append an entry unconditionally and return its id, which equals its array index. Unlike
 // b3InternGeometry it never deduplicates, so the keyframe seed can mirror slots 1:1 even when an
 // already-recorded file carries byte-identical duplicate slots (a hash collision wrote them apart).
-uint32_t b3AppendGeometry( b3GeometryRegistry* reg, b3GeometryKind kind, uint64_t contentHash, uint8_t* bytes, int byteCount );
+uint32_t b3AppendGeometry( b3GeometryRegistry* reg, b3GeometryKind kind, uint64_t contentHash, const uint8_t* bytes, int byteCount );
 void b3FreeRegistry( b3GeometryRegistry* reg );
 void b3RecWriteRegistry( b3Recording* rec );
 
@@ -366,13 +371,10 @@ uint64_t b3HashQueryTag( uint64_t id, const char* name );
 void b3RecInternTag( b3Recording* rec, uint64_t key, uint64_t id, const char* name );
 
 // Intern each large geometry kind and return a stable u32 id for use in create ops.
-// Caller does NOT free bytes; b3InternGeometry takes ownership (frees on duplicate).
 uint32_t b3RecInternHull( b3Recording* rec, const b3HullData* hull );
 uint32_t b3RecInternMesh( b3Recording* rec, const b3MeshData* mesh );
 uint32_t b3RecInternHeightField( b3Recording* rec, const b3HeightFieldData* hf );
 uint32_t b3RecInternCompound( b3Recording* rec, const b3CompoundData* compound );
-
-uint64_t b3Hash64Blob( const uint8_t* bytes, int n );
 
 // Lifecycle engine-side hooks
 void b3StartRecordingIntoBuffer( b3World* world, b3Recording* recording );

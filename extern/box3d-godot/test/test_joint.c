@@ -296,6 +296,116 @@ static int TestMotorJoint( void )
 	return FinishJoint( jointId, f.worldId );
 }
 
+static int TestMoverJoint( void )
+{
+	JointFixture f = CreateJointFixture();
+
+	b3MoverJointDef def = b3DefaultMoverJointDef();
+	SetCommonFrames( &def.base, &f );
+	b3JointId jointId = b3CreateMoverJoint( f.worldId, &def );
+
+	if ( ExerciseJointBase( jointId, f.worldId, f.groundId, f.bodyId, b3_moverJoint ) != 0 )
+	{
+		return 1;
+	}
+
+	b3Vec3 velocity = { 1.0f, 2.0f, -3.0f };
+	b3MoverJoint_SetLinearVelocity( jointId, velocity );
+	b3Vec3 gotVelocity = b3MoverJoint_GetLinearVelocity( jointId );
+	ENSURE( gotVelocity.x == 1.0f && gotVelocity.y == 2.0f && gotVelocity.z == -3.0f );
+
+	// The y axis has no force budget, so it must stay at rest while x and z reach the target
+	float maxForce = 1000.0f;
+	b3MoverJoint_SetMaxVelocityForce( jointId, maxForce );
+	float gotForce = b3MoverJoint_GetMaxVelocityForce( jointId );
+	ENSURE( gotForce == 1000.0f );
+
+	for ( int i = 0; i < 30; ++i )
+	{
+		b3World_Step( f.worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3Vec3 v = b3Body_GetLinearVelocity( f.bodyId );
+	ENSURE_SMALL( v.x - 1.0f, 1.0e-4f );
+	ENSURE_SMALL( v.y, 1.0e-4f );
+	ENSURE_SMALL( v.z + 3.0f, 1.0e-4f );
+
+	b3Vec3 w = b3Body_GetAngularVelocity( f.bodyId );
+	ENSURE( w.x == 0.0f && w.y == 0.0f && w.z == 0.0f );
+
+	return FinishJoint( jointId, f.worldId );
+}
+
+// A box held up by a pogo spring under gravity should settle at the rest length
+static int TestPogoJoint( void )
+{
+	JointFixture f = CreateJointFixture();
+	b3World_SetGravity( f.worldId, (b3Vec3){ 0.0f, -10.0f, 0.0f } );
+
+	float restLength = 2.0f;
+	float mass = b3Body_GetMass( f.bodyId );
+
+	b3PogoJointDef def = b3DefaultPogoJointDef();
+	def.base.bodyIdA = f.groundId;
+	def.base.bodyIdB = f.bodyId;
+	def.base.localFrameA.p = (b3Vec3){ 0.0f, 1.0f, 0.0f };
+	def.base.localFrameB.p = (b3Vec3){ 0.0f, 0.0f, 0.0f };
+	def.normal = b3Vec3_axisY;
+	def.restLength = restLength;
+	def.hertz = 2.0f;
+	def.dampingRatio = 1.0f;
+	def.maxCompressionForce = 100.0f * 10.0f * mass;
+	def.maxTensionForce = 100.0f * 10.0f * mass;
+	b3JointId jointId = b3CreatePogoJoint( f.worldId, &def );
+
+	if ( ExerciseJointBase( jointId, f.worldId, f.groundId, f.bodyId, b3_pogoJoint ) != 0 )
+	{
+		return 1;
+	}
+
+	b3PogoJoint_SetRestLength( jointId, restLength );
+	ENSURE( b3PogoJoint_GetRestLength( jointId ) == restLength );
+
+	b3PogoJoint_SetSpringHertz( jointId, 3.0f );
+	ENSURE( b3PogoJoint_GetSpringHertz( jointId ) == 3.0f );
+
+	b3PogoJoint_SetSpringDampingRatio( jointId, 0.9f );
+	ENSURE( b3PogoJoint_GetSpringDampingRatio( jointId ) == 0.9f );
+
+	float maxTension = 50.0f * 10.0f * mass;
+	b3PogoJoint_SetMaxTensionForce( jointId, maxTension );
+	ENSURE( b3PogoJoint_GetMaxTensionForce( jointId ) == maxTension );
+
+	float maxCompression = 60.0f * 10.0f * mass;
+	b3PogoJoint_SetMaxCompressionForce( jointId, maxCompression );
+	ENSURE( b3PogoJoint_GetMaxCompressionForce( jointId ) == maxCompression );
+
+	b3Vec3 normal = b3Normalize( (b3Vec3){ 0.2f, 1.0f, 0.0f } );
+	b3PogoJoint_SetNormal( jointId, normal );
+	b3Vec3 gotNormal = b3PogoJoint_GetNormal( jointId );
+	ENSURE( gotNormal.x == normal.x && gotNormal.y == normal.y && gotNormal.z == normal.z );
+	b3PogoJoint_SetNormal( jointId, b3Vec3_axisY );
+
+	// Starts stretched by one meter
+	ENSURE_SMALL( b3PogoJoint_GetCurrentLength( jointId ) - 3.0f, 1.0e-5f );
+
+	for ( int i = 0; i < 300; ++i )
+	{
+		b3World_Step( f.worldId, 1.0f / 60.0f, 4 );
+	}
+
+	ENSURE_SMALL( b3PogoJoint_GetCurrentLength( jointId ) - restLength, 0.01f );
+	ENSURE_SMALL( b3Body_GetLinearVelocity( f.bodyId ).y, 0.01f );
+
+	// Holding the weight takes an impulse of m * g * h each sub-step
+	ENSURE_SMALL( b3PogoJoint_GetImpulse( jointId ) - mass * 10.0f / 240.0f, 0.001f * mass );
+
+	b3Vec3 force = b3Joint_GetConstraintForce( jointId );
+	ENSURE_SMALL( force.y - mass * 10.0f, 0.1f * mass );
+
+	return FinishJoint( jointId, f.worldId );
+}
+
 static int TestPrismaticJoint( void )
 {
 	JointFixture f = CreateJointFixture();
@@ -565,17 +675,123 @@ static int TestWheelJoint( void )
 	return FinishJoint( jointId, f.worldId );
 }
 
+// Issue #117: a joint created with collideConnected false must clear contacts
+// that already exist between the two bodies.
+static int TestCreateJointClearsContacts( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+
+	bodyDef.position = (b3Pos){ 0.0f, 0.0f, 0.0f };
+	b3BodyId bodyIdA = b3CreateBody( worldId, &bodyDef );
+
+	// Overlapping so a touching contact forms
+	bodyDef.position = (b3Pos){ 0.5f, 0.0f, 0.0f };
+	b3BodyId bodyIdB = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	b3CreateHullShape( bodyIdA, &shapeDef, &box.base );
+	b3CreateHullShape( bodyIdB, &shapeDef, &box.base );
+
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( b3Body_GetContactCapacity( bodyIdA ) > 0 );
+
+	b3RevoluteJointDef jointDef = b3DefaultRevoluteJointDef();
+	jointDef.base.bodyIdA = bodyIdA;
+	jointDef.base.bodyIdB = bodyIdB;
+	jointDef.base.collideConnected = false;
+	b3CreateRevoluteJoint( worldId, &jointDef );
+
+	ENSURE( b3Body_GetContactCapacity( bodyIdA ) == 0 );
+	ENSURE( b3Body_GetContactCapacity( bodyIdB ) == 0 );
+
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( b3Body_GetContactCapacity( bodyIdA ) == 0 );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+// Issue #164: a joint with no dynamic body lives in the static set even when one body is an awake
+// kinematic. Disabling and enabling that body has to respect this, whether the joint was created
+// that way or got there through body type changes.
+static int TestNonDynamicJointDisable( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	b3BodyId bodyIdA = b3CreateBody( worldId, &bodyDef );
+	bodyDef.position = (b3Pos){ 2.0f, 0.0f, 0.0f };
+	b3BodyId bodyIdB = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3BoxHull box = b3MakeCubeHull( 0.5f );
+	b3CreateHullShape( bodyIdA, &shapeDef, &box.base );
+	b3CreateHullShape( bodyIdB, &shapeDef, &box.base );
+
+	b3WeldJointDef jointDef = b3DefaultWeldJointDef();
+	jointDef.base.bodyIdA = bodyIdA;
+	jointDef.base.bodyIdB = bodyIdB;
+	b3JointId weldId = b3CreateWeldJoint( worldId, &jointDef );
+
+	b3Body_SetType( bodyIdA, b3_staticBody );
+	b3Body_SetType( bodyIdB, b3_kinematicBody );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+	b3Body_Disable( bodyIdB );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	b3Body_Enable( bodyIdB );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( b3Joint_IsValid( weldId ) );
+
+	b3Body_SetType( bodyIdB, b3_dynamicBody );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( b3Joint_IsAwake( weldId ) );
+
+	// Created directly between a static and a kinematic body
+	bodyDef.type = b3_kinematicBody;
+	bodyDef.position = (b3Pos){ 4.0f, 0.0f, 0.0f };
+	b3BodyId bodyIdC = b3CreateBody( worldId, &bodyDef );
+	b3CreateHullShape( bodyIdC, &shapeDef, &box.base );
+
+	b3RevoluteJointDef revoluteDef = b3DefaultRevoluteJointDef();
+	revoluteDef.base.bodyIdA = bodyIdA;
+	revoluteDef.base.bodyIdB = bodyIdC;
+	b3JointId revoluteId = b3CreateRevoluteJoint( worldId, &revoluteDef );
+
+	b3Body_Disable( bodyIdC );
+	b3Body_Enable( bodyIdC );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( b3Joint_IsAwake( revoluteId ) == false );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
 int JointTest( void )
 {
 	RUN_SUBTEST( TestParallelJoint );
 	RUN_SUBTEST( TestDistanceJoint );
 	RUN_SUBTEST( TestFilterJoint );
 	RUN_SUBTEST( TestMotorJoint );
+	RUN_SUBTEST( TestMoverJoint );
+	RUN_SUBTEST( TestPogoJoint );
 	RUN_SUBTEST( TestPrismaticJoint );
 	RUN_SUBTEST( TestRevoluteJoint );
 	RUN_SUBTEST( TestSphericalJoint );
 	RUN_SUBTEST( TestWeldJoint );
 	RUN_SUBTEST( TestWheelJoint );
+	RUN_SUBTEST( TestCreateJointClearsContacts );
+	RUN_SUBTEST( TestNonDynamicJointDisable );
 
 	return 0;
 }

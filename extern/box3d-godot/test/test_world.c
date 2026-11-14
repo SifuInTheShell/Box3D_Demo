@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 #include "benchmarks.h"
+#include "body.h"
+#include "dynamic_tree.h"
 #include "overflow_color.h"
+#include "physics_world.h"
+#include "platform.h"
+#include "recording.h"
 #include "test_macros.h"
 
 #include "box3d/box3d.h"
@@ -10,6 +15,7 @@
 #include "box3d/constants.h"
 #include "box3d/math_functions.h"
 
+#include <float.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -309,6 +315,14 @@ int TestWorldCoverage( void )
 	b3World_SetMaximumLinearSpeed( worldId, 10.0f );
 	value = b3World_GetMaximumLinearSpeed( worldId );
 	ENSURE( value == 10.0f );
+
+	b3World_SetIsotropicInertiaTolerance( worldId, 0.5f );
+	value = b3World_GetIsotropicInertiaTolerance( worldId );
+	ENSURE( value == 0.5f );
+
+	b3World_SetIsotropicInertiaTolerance( worldId, 2.0f );
+	value = b3World_GetIsotropicInertiaTolerance( worldId );
+	ENSURE( value == 1.0f );
 
 	b3World_EnableWarmStarting( worldId, true );
 	flag = b3World_IsWarmStartingEnabled( worldId );
@@ -970,6 +984,290 @@ static int EnableContactRecyclingTest( void )
 	return 0;
 }
 
+// A slow sphere closes on a static round shape from just outside contact. The step is too short
+// to make the sphere fast, so the pair is eligible for recycling. A routine without a speculative
+// margin left the pair empty and recycling then let the sphere sink without a contact. Discussion #175.
+static int RunRecycledApproach( bool capsuleTarget )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId targetId = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	float targetRadius = 0.5f;
+	if ( capsuleTarget )
+	{
+		b3Capsule capsule = { { -1.0f, 0.0f, 0.0f }, { 1.0f, 0.0f, 0.0f }, targetRadius };
+		b3CreateCapsuleShape( targetId, &shapeDef, &capsule );
+	}
+	else
+	{
+		b3Sphere sphere = { b3Vec3_zero, targetRadius };
+		b3CreateSphereShape( targetId, &shapeDef, &sphere );
+	}
+
+	float radius = 0.25f;
+	float totalRadius = targetRadius + radius;
+	float timeStep = 1.0f / 60.0f;
+
+	// Half the speculative distance per step
+	float speed = 0.5f * B3_SPECULATIVE_DISTANCE / timeStep;
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, totalRadius + 0.25f * B3_SPECULATIVE_DISTANCE, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ 0.0f, -speed, 0.0f };
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+
+	b3Sphere sphere = { b3Vec3_zero, radius };
+	b3CreateSphereShape( bodyId, &shapeDef, &sphere );
+
+	float minSeparation = FLT_MAX;
+	for ( int i = 0; i < 20; ++i )
+	{
+		b3World_Step( worldId, timeStep, 4 );
+
+		b3Pos p = b3Body_GetPosition( bodyId );
+		minSeparation = b3MinFloat( minSeparation, (float)p.y - totalRadius );
+	}
+
+	b3DestroyWorld( worldId );
+
+	ENSURE( minSeparation > -B3_LINEAR_SLOP );
+
+	return 0;
+}
+
+static int RecycledSphereApproachTest( void )
+{
+	ENSURE( RunRecycledApproach( false ) == 0 );
+	ENSURE( RunRecycledApproach( true ) == 0 );
+	return 0;
+}
+
+static bool PreSolveReject( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal, void* context )
+{
+	(void)shapeIdA;
+	(void)shapeIdB;
+	(void)point;
+	(void)normal;
+	bool* reject = context;
+	return *reject == false;
+}
+
+// A rejected pre-solve frees the manifold while the shapes may already touch. The next step must
+// rebuild the contact and ask again instead of recycling the empty pair.
+static int PreSolveRejectRecycleTest( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.enableSleep = false;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	bool reject = true;
+	b3World_SetPreSolveCallback( worldId, PreSolveReject, &reject );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	bodyDef.position = (b3Pos){ 0.0f, -0.5f, 0.0f };
+	b3BodyId groundId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull groundBox = b3MakeBoxHull( 10.0f, 0.5f, 10.0f );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHullShape( groundId, &shapeDef, &groundBox.base );
+
+	float radius = 0.25f;
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, radius, 0.0f };
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+
+	shapeDef.enablePreSolveEvents = true;
+	b3Sphere sphere = { b3Vec3_zero, radius };
+	b3CreateSphereShape( bodyId, &shapeDef, &sphere );
+
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+	reject = false;
+
+	float minSeparation = FLT_MAX;
+	for ( int i = 0; i < 30; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+		b3Pos p = b3Body_GetPosition( bodyId );
+		minSeparation = b3MinFloat( minSeparation, (float)p.y - radius );
+	}
+
+	b3DestroyWorld( worldId );
+
+	ENSURE( minSeparation > -B3_LINEAR_SLOP );
+
+	return 0;
+}
+
+static int CountRecycledResting( bool enableSpeculative )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.enableSleep = false;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	bodyDef.position = (b3Pos){ 0.0f, -0.5f, 0.0f };
+	b3BodyId groundId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull groundBox = b3MakeBoxHull( 10.0f, 0.5f, 10.0f );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHullShape( groundId, &shapeDef, &groundBox.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 0.5f, 0.0f };
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+
+	shapeDef.enableSpeculativeContact = enableSpeculative;
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	b3CreateHullShape( bodyId, &shapeDef, &box.base );
+
+	int recycledCount = 0;
+	for ( int i = 0; i < 60; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		recycledCount += b3World_GetCounters( worldId ).recycledContactCount;
+	}
+
+	b3DestroyWorld( worldId );
+
+	return recycledCount;
+}
+
+// Without speculative points an empty pair may be closer than the speculative distance, so these
+// contacts must never recycle
+static int SpeculativeOffRecycleTest( void )
+{
+	ENSURE( CountRecycledResting( true ) > 0 );
+	ENSURE( CountRecycledResting( false ) == 0 );
+	return 0;
+}
+
+static int CountMovedNodes( const b3DynamicTree* tree )
+{
+	int count = 0;
+	for ( int i = 0; i < tree->nodeEnd; ++i )
+	{
+		const b3TreeNode* node = tree->nodes + i;
+		if ( b3IsEmptyNode( node ) == false && b3IsNodeMoved( node ) )
+		{
+			count += 1;
+		}
+	}
+
+	return count;
+}
+
+// A proxy can be enlarged in one step and destroyed before the next, emptying the move buffer.
+// The trees must still be rebuilt or the enlarged nodes survive into the next step. Issue #149.
+static int TestEnlargedProxyDestroyed( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3World* world = b3GetWorldFromId( worldId );
+	const b3DynamicTree* tree = world->broadPhase.trees + b3_dynamicBody;
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3Sphere sphere = { b3Vec3_zero, 0.25f };
+
+	// Resting bodies keep the tree deep enough that the mover has an ancestor that outlives it
+	for ( int i = 0; i < 8; ++i )
+	{
+		bodyDef.position = (b3Pos){ 2.0f * i, 0.0f, 0.0f };
+		b3BodyId restingId = b3CreateBody( worldId, &bodyDef );
+		b3CreateSphereShape( restingId, &shapeDef, &sphere );
+	}
+
+	// This body outruns its AABB margin every step
+	bodyDef.position = (b3Pos){ 7.0f, 1.0f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ 6.0f, 0.0f, 0.0f };
+	b3BodyId moverId = b3CreateBody( worldId, &bodyDef );
+	b3CreateSphereShape( moverId, &shapeDef, &sphere );
+
+	float timeStep = 1.0f / 60.0f;
+	b3World_Step( worldId, timeStep, 4 );
+
+	ENSURE( CountMovedNodes( tree ) > 0 );
+
+	b3DestroyBody( moverId );
+
+	// Removing the leaf re-derives the marks along its path, so the tree is already consistent
+	// here and nothing is left marked to drive a rebuild. What the destroy can still leave
+	// stale is the DFS order the sweep refit needs, so the step has to rebuild regardless.
+	b3DynamicTree_Validate( tree );
+	ENSURE( CountMovedNodes( tree ) == 0 );
+
+	b3World_Step( worldId, timeStep, 4 );
+
+	ENSURE( CountMovedNodes( tree ) == 0 );
+	ENSURE( tree->dfsOrdered );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+// b3DestroyBody tears shapes down inline instead of going through the shape destroy path, so it
+// needs its own compound census decrement. A leaked count pins the broad-phase on the slow
+// per-candidate compound path for the life of the world and rides along into snapshots.
+static int TestCompoundShapeCount( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3World* world = b3GetWorldFromId( worldId );
+	ENSURE( world->compoundShapeCount == 0 );
+
+	b3BoxHull box = b3MakeBoxHull( 1.0f, 1.0f, 1.0f );
+
+	b3CompoundHullDef hull;
+	hull.hull = &box.base;
+	hull.transform = (b3Transform){ b3Vec3_zero, b3Quat_identity };
+	hull.material = b3DefaultSurfaceMaterial();
+
+	b3CompoundDef compoundDef = { 0 };
+	compoundDef.hulls = &hull;
+	compoundDef.hullCount = 1;
+	b3CompoundData* compound = b3CreateCompound( &compoundDef );
+	ENSURE( compound != NULL );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+
+	// Shape destroyed on its own
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeId shapeId = b3CreateBakedCompoundShape( bodyId, &shapeDef, compound );
+	ENSURE( world->compoundShapeCount == 1 );
+	b3DestroyShape( shapeId, true );
+	ENSURE( world->compoundShapeCount == 0 );
+	b3DestroyBody( bodyId );
+
+	// Shape carried away by its body
+	bodyId = b3CreateBody( worldId, &bodyDef );
+	b3CreateBakedCompoundShape( bodyId, &shapeDef, compound );
+	ENSURE( world->compoundShapeCount == 1 );
+	b3DestroyBody( bodyId );
+	ENSURE( world->compoundShapeCount == 0 );
+
+	b3DestroyWorld( worldId );
+	b3DestroyCompound( compound );
+	return 0;
+}
+
 // Identical hull data is shared through a reference counted world database.
 static int TestHullDatabase( void )
 {
@@ -1158,6 +1456,568 @@ static int TestContinuousMoveEvent( void )
 	return 0;
 }
 
+// The contact body sim locators are persistent state. Every contact in every set carries the
+// current encoding for both of its bodies: the awake local index, a static tag, or null for a
+// body that fell asleep. The scenes below drive each site that can invalidate one. The gate is
+// b3ValidateSolverSets, which asserts the invariant on every mutation and every step, so a
+// dropped refresh trips there rather than producing a plausible but wrong simulation. Each scene
+// also runs at worker counts 1 and 4 with the state hashes compared.
+
+static b3WorldId CreateLocatorWorld( int workerCount )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = workerCount;
+	return b3CreateWorld( &worldDef );
+}
+
+static b3BodyId CreateLocatorBody( b3WorldId worldId, b3BodyType type, b3Pos position, float hx, float hy, float hz )
+{
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = type;
+	bodyDef.position = position;
+	b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3BoxHull box = b3MakeBoxHull( hx, hy, hz );
+	b3CreateHullShape( bodyId, &shapeDef, &box.base );
+
+	return bodyId;
+}
+
+static void StepLocatorWorld( b3WorldId worldId, int stepCount )
+{
+	for ( int i = 0; i < stepCount; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+}
+
+// Steps until the body sleeps or the budget runs out. Returns the steps taken.
+static int StepUntilAsleep( b3WorldId worldId, b3BodyId bodyId, int maxSteps )
+{
+	for ( int i = 0; i < maxSteps; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		if ( b3Body_IsAwake( bodyId ) == false )
+		{
+			return i + 1;
+		}
+	}
+
+	return maxSteps;
+}
+
+// Sleep and wake: first touch puts contacts in the graph, sleeping nulls the locators of the
+// island bodies, waking restores their awake indices. The plate beside the stack holds a
+// non-touching contact across the whole cycle, and that is the contact the wake path has to fix up
+// itself. A touching contact would get a fresh encoding from the graph add and hide a dropped
+// refresh.
+static uint64_t LocatorSleepWakeScene( int workerCount, int* failed )
+{
+	b3WorldId worldId = CreateLocatorWorld( workerCount );
+	CreateLocatorBody( worldId, b3_staticBody, (b3Pos){ 0.0f, -1.0f, 0.0f }, 5.0f, 1.0f, 5.0f );
+
+	b3BodyId stackId[3];
+	for ( int i = 0; i < 3; ++i )
+	{
+		stackId[i] = CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ 0.0f, 0.5f + i, 0.0f }, 0.5f, 0.5f, 0.5f );
+	}
+
+	// Beside the top box, close enough that the fat bounds overlap and far enough that the
+	// shapes never touch. Kinematic and awake, so the contact stays in the awake set while the
+	// stack sleeps. Off to the side so it does not catch the body dropped later.
+	b3BodyId plateId = CreateLocatorBody( worldId, b3_kinematicBody, (b3Pos){ 1.04f, 2.5f, 0.0f }, 0.5f, 0.5f, 0.5f );
+	b3Body_EnableSleep( plateId, false );
+
+	int steps = StepUntilAsleep( worldId, stackId[0], 300 );
+	if ( steps == 300 || b3Body_IsAwake( stackId[2] ) == true )
+	{
+		*failed = 1;
+	}
+
+	// Wake without contact so the non-touching contact keeps its stale locator if the wake
+	// path forgets to refresh
+	b3Body_SetAwake( stackId[0], true );
+	StepLocatorWorld( worldId, 5 );
+
+	if ( b3Body_IsAwake( stackId[2] ) == false )
+	{
+		*failed = 1;
+	}
+
+	steps = StepUntilAsleep( worldId, stackId[0], 300 );
+	if ( steps == 300 )
+	{
+		*failed = 1;
+	}
+
+	// Dropping a body on the pile drives the wake path through first touch. The pile can settle
+	// and sleep again, so catch the wake as it happens.
+	CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ 0.0f, 8.0f, 0.0f }, 0.5f, 0.5f, 0.5f );
+
+	bool woke = false;
+	for ( int i = 0; i < 180; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		woke = woke || b3Body_IsAwake( stackId[0] );
+	}
+
+	if ( woke == false )
+	{
+		*failed = 1;
+	}
+
+	uint64_t hash = b3HashWorldState( b3GetWorldFromId( worldId ) );
+	b3DestroyWorld( worldId );
+	return hash;
+}
+
+// An island falling asleep and a body leaving the awake set both swap the last awake sim into
+// the hole. The pile that never sleeps supplies a moved body that still owns contacts.
+static uint64_t LocatorAwakeNeighborScene( int workerCount, int* failed )
+{
+	b3WorldId worldId = CreateLocatorWorld( workerCount );
+	CreateLocatorBody( worldId, b3_staticBody, (b3Pos){ 0.0f, -1.0f, 0.0f }, 30.0f, 1.0f, 5.0f );
+
+	// This island sleeps
+	b3BodyId sleeperId[2];
+	for ( int i = 0; i < 2; ++i )
+	{
+		sleeperId[i] = CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ -10.0f, 0.5f + i, 0.0f }, 0.5f, 0.5f, 0.5f );
+	}
+
+	// Created after the sleepers so its sims sit at the end of the awake set and get swapped
+	// into the holes the sleeping island leaves behind
+	b3BodyId spareId = CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ 20.0f, 0.5f, 0.0f }, 0.5f, 0.5f, 0.5f );
+	b3Body_EnableSleep( spareId, false );
+
+	b3BodyId awakeId[3];
+	for ( int i = 0; i < 3; ++i )
+	{
+		awakeId[i] = CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ 10.0f, 0.5f + i, 0.0f }, 0.5f, 0.5f, 0.5f );
+		b3Body_EnableSleep( awakeId[i], false );
+	}
+
+	int steps = StepUntilAsleep( worldId, sleeperId[0], 300 );
+	if ( steps == 300 || b3Body_IsAwake( awakeId[0] ) == false )
+	{
+		*failed = 1;
+	}
+
+	StepLocatorWorld( worldId, 10 );
+
+	// Leaving the awake set swaps a body that owns contacts into the spare's slot
+	b3Body_Disable( spareId );
+	StepLocatorWorld( worldId, 10 );
+
+	b3Body_Enable( spareId );
+	StepLocatorWorld( worldId, 10 );
+
+	uint64_t hash = b3HashWorldState( b3GetWorldFromId( worldId ) );
+	b3DestroyWorld( worldId );
+	return hash;
+}
+
+// Destroying a body swaps the last sim of its set into the hole. The moved body keeps its
+// contacts, so its side of each one has to follow it.
+static uint64_t LocatorDestroyScene( int workerCount, int* failed )
+{
+	b3WorldId worldId = CreateLocatorWorld( workerCount );
+	CreateLocatorBody( worldId, b3_staticBody, (b3Pos){ 0.0f, -1.0f, 0.0f }, 5.0f, 1.0f, 5.0f );
+
+	b3BodyId stackId[4];
+	for ( int i = 0; i < 4; ++i )
+	{
+		stackId[i] = CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ 0.0f, 0.5f + i, 0.0f }, 0.5f, 0.5f, 0.5f );
+	}
+
+	StepLocatorWorld( worldId, 30 );
+
+	// The last awake sim moves into this hole while its contacts live
+	b3DestroyBody( stackId[0] );
+	StepLocatorWorld( worldId, 30 );
+
+	// Three static boxes, one resting box each. Destroying the first moves the last static sim.
+	b3BodyId staticId[3];
+	for ( int i = 0; i < 3; ++i )
+	{
+		float x = 10.0f + 4.0f * i;
+		staticId[i] = CreateLocatorBody( worldId, b3_staticBody, (b3Pos){ x, -1.0f, 0.0f }, 1.0f, 1.0f, 1.0f );
+		CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ x, 0.5f, 0.0f }, 0.5f, 0.5f, 0.5f );
+	}
+
+	StepLocatorWorld( worldId, 30 );
+
+	b3DestroyBody( staticId[0] );
+	StepLocatorWorld( worldId, 30 );
+
+	B3_UNUSED( failed );
+
+	uint64_t hash = b3HashWorldState( b3GetWorldFromId( worldId ) );
+	b3DestroyWorld( worldId );
+	return hash;
+}
+
+// A kinematic body parked a hair above a pile keeps a non-touching contact to a body that falls
+// asleep, which is the one case the locator cannot name and has to leave to the cold path.
+static uint64_t LocatorKinematicScene( int workerCount, int* failed )
+{
+	b3WorldId worldId = CreateLocatorWorld( workerCount );
+	CreateLocatorBody( worldId, b3_staticBody, (b3Pos){ 0.0f, -1.0f, 0.0f }, 5.0f, 1.0f, 5.0f );
+
+	b3BodyId boxId = CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ 0.0f, 0.5f, 0.0f }, 0.5f, 0.5f, 0.5f );
+
+	// Close enough that the fat bounds overlap and a non-touching contact exists
+	b3BodyId plateId = CreateLocatorBody( worldId, b3_kinematicBody, (b3Pos){ 0.0f, 1.52f, 0.0f }, 1.0f, 0.5f, 1.0f );
+
+	int steps = StepUntilAsleep( worldId, boxId, 300 );
+	if ( steps == 300 )
+	{
+		*failed = 1;
+	}
+
+	// Drive the plate down to touch and wake the sleeper
+	b3Body_SetLinearVelocity( plateId, (b3Vec3){ 0.0f, -1.0f, 0.0f } );
+	StepLocatorWorld( worldId, 60 );
+
+	if ( b3Body_IsAwake( boxId ) == false )
+	{
+		*failed = 1;
+	}
+
+	uint64_t hash = b3HashWorldState( b3GetWorldFromId( worldId ) );
+	b3DestroyWorld( worldId );
+	return hash;
+}
+
+// Set type and disable move a body between solver sets, which changes the encoding of every
+// contact it has. A joint across two sleeping sets drives the merge path.
+static uint64_t LocatorTransferScene( int workerCount, int* failed )
+{
+	b3WorldId worldId = CreateLocatorWorld( workerCount );
+	CreateLocatorBody( worldId, b3_staticBody, (b3Pos){ 0.0f, -1.0f, 0.0f }, 20.0f, 1.0f, 5.0f );
+
+	b3BodyId boxId = CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ 0.0f, 0.5f, 0.0f }, 0.5f, 0.5f, 0.5f );
+	StepLocatorWorld( worldId, 30 );
+
+	b3Body_SetType( boxId, b3_staticBody );
+	StepLocatorWorld( worldId, 5 );
+	b3Body_SetType( boxId, b3_dynamicBody );
+	StepLocatorWorld( worldId, 5 );
+
+	b3Body_Disable( boxId );
+	StepLocatorWorld( worldId, 5 );
+	b3Body_Enable( boxId );
+	StepLocatorWorld( worldId, 30 );
+
+	// Two piles far enough apart to sleep in separate sets
+	b3BodyId sleeperId[2];
+	sleeperId[0] = CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ -12.0f, 0.5f, 0.0f }, 0.5f, 0.5f, 0.5f );
+	sleeperId[1] = CreateLocatorBody( worldId, b3_dynamicBody, (b3Pos){ 12.0f, 0.5f, 0.0f }, 0.5f, 0.5f, 0.5f );
+
+	int steps = StepUntilAsleep( worldId, sleeperId[0], 300 );
+	if ( steps == 300 || b3Body_IsAwake( sleeperId[1] ) == true )
+	{
+		*failed = 1;
+	}
+
+	b3SphericalJointDef jointDef = b3DefaultSphericalJointDef();
+	jointDef.base.bodyIdA = sleeperId[0];
+	jointDef.base.bodyIdB = sleeperId[1];
+	b3CreateSphericalJoint( worldId, &jointDef );
+
+	StepLocatorWorld( worldId, 30 );
+
+	uint64_t hash = b3HashWorldState( b3GetWorldFromId( worldId ) );
+	b3DestroyWorld( worldId );
+	return hash;
+}
+
+// The fast flag lives on the body sim and gates contact recycling, but a flag sync rebuilds the
+// sim flags from the body row, which never carries it. A public setter called on a body in
+// flight must not drop it, or the recycle path can take a fast pair.
+static int LocatorFastFlagTest( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	CreateLocatorBody( worldId, b3_staticBody, (b3Pos){ 0.0f, -1.0f, 0.0f }, 5.0f, 1.0f, 5.0f );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ -20.0f, 2.0f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ 400.0f, 0.0f, 0.0f };
+	b3BodyId bulletId = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3Sphere sphere = { { 0.0f, 0.0f, 0.0f }, 0.1f };
+	b3CreateSphereShape( bulletId, &shapeDef, &sphere );
+
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+	b3World* world = b3GetWorldFromId( worldId );
+	b3Body* body = b3GetBodyFullId( world, bulletId );
+	b3BodySim* sim = b3GetBodySim( world, body );
+	ENSURE( ( sim->flags & b3_isFast ) != 0 );
+
+	// Any public setter that syncs flags. The locks have to actually change or the setter
+	// returns early and never syncs.
+	b3MotionLocks locks = { 0 };
+	locks.angularX = true;
+	b3Body_SetMotionLocks( bulletId, locks );
+
+	sim = b3GetBodySim( world, b3GetBodyFullId( world, bulletId ) );
+	ENSURE( ( sim->flags & b3_isFast ) != 0 );
+
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+static int BodySimLocatorTest( void )
+{
+	typedef uint64_t ( *LocatorScene )( int workerCount, int* failed );
+	LocatorScene scenes[5] = {
+		LocatorSleepWakeScene,
+		LocatorAwakeNeighborScene,
+		LocatorDestroyScene,
+		LocatorKinematicScene,
+		LocatorTransferScene,
+	};
+
+	for ( int i = 0; i < 5; ++i )
+	{
+		int failed = 0;
+		uint64_t hash1 = scenes[i]( 1, &failed );
+		uint64_t hash4 = scenes[i]( 4, &failed );
+		ENSURE( failed == 0 );
+		ENSURE( hash1 == hash4 );
+	}
+
+	return LocatorFastFlagTest();
+}
+
+// A query thread runs static overlaps while the main thread steps. A static body is added before
+// each step so the step clears moved flags in the static tree under the reader. Run under TSan
+// to check the relaxed flag access.
+typedef struct StaticQueryShared
+{
+	b3WorldId worldId;
+	b3AtomicInt stepping;
+	b3AtomicInt quit;
+	b3AtomicInt idle;
+	b3AtomicInt started;
+	b3AtomicInt expectedCount;
+	b3AtomicInt queryCount;
+	b3AtomicInt failCount;
+} StaticQueryShared;
+
+typedef struct StaticQueryHits
+{
+	b3WorldId worldId;
+	int count;
+	bool nonStatic;
+} StaticQueryHits;
+
+static bool StaticQueryFcn( b3ShapeId shapeId, void* context )
+{
+	StaticQueryHits* hits = context;
+	b3BodyId bodyId = b3Shape_GetBody( shapeId );
+	hits->count += 1;
+
+	// Body type is read through the body array, which the step mutates for awake bodies. Static
+	// bodies are not touched by the step.
+	if ( b3Body_GetType( bodyId ) != b3_staticBody )
+	{
+		hits->nonStatic = true;
+	}
+	return true;
+}
+
+typedef struct StaticCastHit
+{
+	int count;
+	float fraction;
+	bool nonStatic;
+} StaticCastHit;
+
+static float StaticCastFcn( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float fraction, uint64_t userMaterialId,
+							int triangleIndex, int childIndex, void* context )
+{
+	B3_UNUSED( point, normal, userMaterialId, triangleIndex, childIndex );
+
+	StaticCastHit* hit = context;
+	hit->count += 1;
+	hit->fraction = fraction;
+	if ( b3Body_GetType( b3Shape_GetBody( shapeId ) ) != b3_staticBody )
+	{
+		hit->nonStatic = true;
+	}
+	return fraction;
+}
+
+static bool CheckStaticQueries( b3WorldId worldId, int expectedCount )
+{
+	b3QueryFilter filter = b3DefaultQueryFilter();
+
+	b3Vec3 corners[8];
+	for ( int i = 0; i < 8; ++i )
+	{
+		corners[i] = (b3Vec3){ ( i & 1 ) ? 100.0f : -100.0f, ( i & 2 ) ? 10.0f : -10.0f, ( i & 4 ) ? 100.0f : -100.0f };
+	}
+	b3ShapeProxy boxProxy = { corners, 8, 0.0f };
+
+	StaticQueryHits hits = { worldId, 0, false };
+	b3World_OverlapShape_Static( worldId, b3Pos_zero, &boxProxy, filter, StaticQueryFcn, &hits );
+	if ( hits.count != expectedCount || hits.nonStatic )
+	{
+		return false;
+	}
+
+	// Straight down through the column of a dynamic cube, so only the static tile can answer
+	b3Pos origin = { 0.5f, 5.0f, -9.5f };
+	b3Vec3 translation = { 0.0f, -10.0f, 0.0f };
+
+	StaticCastHit rayHit = { 0, 1.0f, false };
+	b3World_CastRay_Static( worldId, origin, translation, filter, StaticCastFcn, &rayHit );
+	if ( rayHit.count == 0 || rayHit.nonStatic || b3AbsFloat( rayHit.fraction - 0.5f ) > 0.001f )
+	{
+		return false;
+	}
+
+	b3Vec3 center = b3Vec3_zero;
+	b3ShapeProxy sphereProxy = { &center, 1, 0.25f };
+	StaticCastHit shapeHit = { 0, 1.0f, false };
+	b3World_CastShape_Static( worldId, origin, &sphereProxy, translation, filter, StaticCastFcn, &shapeHit );
+	if ( shapeHit.count == 0 || shapeHit.nonStatic || b3AbsFloat( shapeHit.fraction - 0.475f ) > 0.001f )
+	{
+		return false;
+	}
+
+	return true;
+}
+
+static void StaticQueryThread( void* context )
+{
+	StaticQueryShared* shared = context;
+	b3AABB box = { { -100.0f, -10.0f, -100.0f }, { 100.0f, 10.0f, 100.0f } };
+	b3QueryFilter filter = b3DefaultQueryFilter();
+
+	while ( b3AtomicLoadInt( &shared->quit ) == 0 )
+	{
+		if ( b3AtomicLoadInt( &shared->stepping ) == 0 )
+		{
+			b3AtomicStoreInt( &shared->idle, 1 );
+			b3Yield();
+			continue;
+		}
+
+		b3AtomicStoreInt( &shared->idle, 0 );
+		b3AtomicStoreInt( &shared->started, 1 );
+		int expected = b3AtomicLoadInt( &shared->expectedCount );
+
+		StaticQueryHits hits = { shared->worldId, 0, false };
+		b3World_OverlapAABB_Static( shared->worldId, box, filter, StaticQueryFcn, &hits );
+		bool castsPassed = CheckStaticQueries( shared->worldId, expected );
+		b3AtomicFetchAddInt( &shared->queryCount, 1 );
+
+		if ( hits.count != expected || hits.nonStatic || castsPassed == false )
+		{
+			b3AtomicFetchAddInt( &shared->failCount, 1 );
+		}
+	}
+}
+
+static int TestOverlapStaticDuringStep( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 4;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3BoxHull tile = b3MakeBoxHull( 1.0f, 0.5f, 1.0f );
+	int staticCount = 0;
+
+	for ( int i = -10; i < 10; ++i )
+	{
+		for ( int j = -10; j < 10; ++j )
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.position = (b3Pos){ 2.0f * i + 1.0f, -0.5f, 2.0f * j + 1.0f };
+			b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+			b3CreateHullShape( bodyId, &shapeDef, &tile.base );
+			staticCount += 1;
+		}
+	}
+
+	b3BoxHull cube = b3MakeBoxHull( 0.4f, 0.4f, 0.4f );
+	for ( int i = 0; i < 400; ++i )
+	{
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = (b3Pos){ -9.5f + ( i % 20 ), 1.0f + 0.9f * ( i / 100 ), -9.5f + ( ( i / 20 ) % 5 ) * 4.0f };
+		b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+		b3CreateHullShape( bodyId, &shapeDef, &cube.base );
+	}
+
+	StaticQueryShared shared = { 0 };
+	shared.worldId = worldId;
+	b3Thread* thread = b3CreateThread( StaticQueryThread, &shared, "static query" );
+
+	b3BoxHull post = b3MakeBoxHull( 0.1f, 1.0f, 0.1f );
+	for ( int step = 0; step < 120; ++step )
+	{
+		// The query thread is idle, so the static tree may change.
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.position = (b3Pos){ -50.0f + step, 1.0f, 50.0f };
+		b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+		b3CreateHullShape( bodyId, &shapeDef, &post.base );
+		staticCount += 1;
+
+		ENSURE( b3HasTreeMoved( b3GetWorldFromId( worldId )->broadPhase.trees + b3_staticBody ) );
+
+		b3AtomicStoreInt( &shared.expectedCount, staticCount );
+		b3AtomicStoreInt( &shared.started, 0 );
+		b3AtomicStoreInt( &shared.stepping, 1 );
+
+		// Scheduling decides how many rounds land inside the step, so only wait for one to begin
+		while ( b3AtomicLoadInt( &shared.started ) == 0 )
+		{
+			b3Yield();
+		}
+
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+		b3AtomicStoreInt( &shared.stepping, 0 );
+		b3AtomicStoreInt( &shared.idle, 0 );
+		while ( b3AtomicLoadInt( &shared.idle ) == 0 )
+		{
+			b3Yield();
+		}
+
+		ENSURE( b3HasTreeMoved( b3GetWorldFromId( worldId )->broadPhase.trees + b3_staticBody ) == false );
+	}
+
+	b3AtomicStoreInt( &shared.quit, 1 );
+	b3JoinThread( thread );
+
+	// Each step started a round, and the thread cannot report idle until that round finishes
+	ENSURE( b3AtomicLoadInt( &shared.queryCount ) >= 120 );
+	ENSURE( b3AtomicLoadInt( &shared.failCount ) == 0 );
+
+	// The serial path agrees with the regular overlap filtered to static bodies.
+	StaticQueryHits hits = { worldId, 0, false };
+	b3AABB box = { { -100.0f, -10.0f, -100.0f }, { 100.0f, 10.0f, 100.0f } };
+	b3World_OverlapAABB_Static( worldId, box, b3DefaultQueryFilter(), StaticQueryFcn, &hits );
+	ENSURE( hits.count == staticCount );
+	ENSURE( hits.nonStatic == false );
+	ENSURE( CheckStaticQueries( worldId, staticCount ) );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
 int WorldTest( void )
 {
 	RUN_SUBTEST( HelloWorld );
@@ -1178,8 +2038,15 @@ int WorldTest( void )
 	RUN_SUBTEST( EnableSleepFlagSyncTest );
 	RUN_SUBTEST( EnableSleepNoopUnlockTest );
 	RUN_SUBTEST( EnableContactRecyclingTest );
+	RUN_SUBTEST( RecycledSphereApproachTest );
+	RUN_SUBTEST( PreSolveRejectRecycleTest );
+	RUN_SUBTEST( SpeculativeOffRecycleTest );
 	RUN_SUBTEST( TestSetWorkerCount );
 	RUN_SUBTEST( TestHullDatabase );
+	RUN_SUBTEST( TestEnlargedProxyDestroyed );
+	RUN_SUBTEST( TestCompoundShapeCount );
+	RUN_SUBTEST( BodySimLocatorTest );
+	RUN_SUBTEST( TestOverlapStaticDuringStep );
 
 	return 0;
 }

@@ -22,6 +22,12 @@
 #include <cmath>
 #include <godot_cpp/core/math.hpp>
 
+// Upstream erincatto/box3d (79fc559, "Optimizations #168") dropped
+// b3World_RebuildStaticTree from the public header and kept it as an internal
+// testing hook in src/physics_world.h. The engine is compiled into this same
+// library, so declare it here rather than pulling in the internal C header.
+extern "C" void b3World_RebuildStaticTree(b3WorldId worldId);
+
 using namespace godot;
 
 Box3DWorld::Box3DWorld() {}

@@ -1,13 +1,19 @@
-// SPDX-FileCopyrightText: 2025 Erin Catto
+// SPDX-FileCopyrightText: 2026 Erin Catto
 // SPDX-License-Identifier: MIT
 
+#include "gfx/draw.h"
+#include "gfx/keycodes.h"
 #include "imgui.h"
 #include "mesh_loader.h"
+#include "meshoptimizer.h"
 #include "sample.h"
-#include "gfx/draw.h"
 
 #include "box3d/box3d.h"
 
+#include <ctype.h>
+#include <iterator>
+#include <stdio.h>
+#include <stdlib.h>
 #include <vector>
 
 class Crash : public Sample
@@ -130,7 +136,149 @@ public:
 	}
 };
 
-static int sampleMultiplePrismatic = RegisterSample( "Issues", "Multiple Prismatic", MultiplePrismatic::Create );
+static int sampleMultiplePrismatic =
+	RegisterSample( "Issues", "Multiple Prismatic", MultiplePrismatic::Create );
+
+// bad hull SM_Waterfall_MED_Wide_01
+static const b3Vec3 waterfallPoints[] = {
+	{ 0.100183107, -498.925385, -1275.39966 }, { 0.100183107, -498.925415, 0.125000000 },
+	{ 0.100183107, 486.343750, 0.125000000 },  { 0.100183107, 486.343719, -1275.39966 },
+	{ -395.117462, 486.343781, -1462.43750 },  { -395.117462, 486.343750, -96.7426758 },
+	{ -395.117462, -498.925415, -96.7424469 }, { -395.117462, -498.925446, -1462.52612 },
+	{ -186.979691, 486.294891, -1462.47949 },  { -298.250000, 486.294891, 0.125000000 },
+	{ -395.121216, 486.294891, -1462.52612 },  { -186.984360, -498.913361, -1462.48413 },
+	{ -298.250000, -498.913361, 0.125000000 },
+};
+
+static const b3Vec3 quadPoints[] = {
+	{ 100.000000, -142.292389, 130.826111 },  { 99.5354385, -71.3011093, 130.826111 },
+	{ 99.5930862, -80.1112213, -100.000000 }, { 100.000000, -142.292389, -100.000000 },
+	{ 99.5930862, -80.1112213, 130.826111 },
+};
+
+static const b3Vec3 thinBoxPoints[] = {
+	{ -11.3861933, -24.2451687, -12.0037909 }, { -11.3889809, -24.2466526, -11.9013014 },
+	{ -11.3804407, -24.3151531, -12.0046492 }, { -11.3832273, -24.3166409, -11.9021587 },
+	{ -14.4396200, -24.3636723, -12.1324549 }, { -14.4432650, -24.3655701, -12.0299988 },
+	{ -14.4356947, -24.4337788, -12.1336164 }, { -14.4393377, -24.4356804, -12.0311594 },
+};
+
+// Inline point sets are scaled from centimeters. A null point array is a file in data/hulls.
+struct HullSource
+{
+	const char* name;
+	const b3Vec3* points;
+	int count;
+	float scale;
+};
+
+static const HullSource hullSources[] = {
+	{ "waterfall", waterfallPoints, (int)std::size( waterfallPoints ), 0.01f },
+	{ "quad", quadPoints, (int)std::size( quadPoints ), 0.01f },
+	{ "thin box", thinBoxPoints, (int)std::size( thinBoxPoints ), 0.01f },
+	{ "axe.txt", nullptr, 0, 1.0f },
+};
+
+static constexpr int hullSourceCount = (int)std::size( hullSources );
+
+// Reads x, y, z triples separated by commas or whitespace. A C source repro is
+// also accepted: only the first initializer list is parsed, so counts and other
+// numbers in the surrounding code are ignored.
+static bool LoadHullPoints( const char* path, std::vector<b3Vec3>* points )
+{
+	points->clear();
+
+	FILE* file = fopen( path, "rb" );
+	if ( file == nullptr )
+	{
+		fprintf( stderr, "Failed to open '%s'\n", path );
+		return false;
+	}
+
+	fseek( file, 0, SEEK_END );
+	long size = ftell( file );
+	fseek( file, 0, SEEK_SET );
+	if ( size < 0 )
+	{
+		fprintf( stderr, "Failed to read '%s'\n", path );
+		fclose( file );
+		return false;
+	}
+
+	std::vector<char> text( size + 1 );
+	size_t readCount = fread( text.data(), 1, size, file );
+	fclose( file );
+	text[readCount] = '\0';
+
+	char* begin = text.data();
+	char* end = begin + readCount;
+	for ( char* c = begin; *c != '\0'; ++c )
+	{
+		if ( *c != '{' )
+		{
+			continue;
+		}
+
+		char* prev = c - 1;
+		while ( prev >= begin && isspace( (unsigned char)*prev ) )
+		{
+			--prev;
+		}
+
+		if ( prev < begin || *prev != '=' )
+		{
+			continue;
+		}
+
+		begin = c + 1;
+		int depth = 1;
+		for ( end = begin; *end != '\0'; ++end )
+		{
+			if ( *end == '{' )
+			{
+				depth += 1;
+			}
+			else if ( *end == '}' && --depth == 0 )
+			{
+				break;
+			}
+		}
+
+		break;
+	}
+
+	*end = '\0';
+
+	std::vector<float> values;
+	char* cursor = begin;
+	while ( *cursor != '\0' )
+	{
+		char* stop;
+		float value = strtof( cursor, &stop );
+		if ( stop == cursor )
+		{
+			cursor += 1;
+			continue;
+		}
+
+		values.push_back( value );
+		cursor = stop;
+	}
+
+	if ( values.size() % 3 != 0 )
+	{
+		fprintf( stderr, "'%s' has %d values, not a multiple of 3\n", path, (int)values.size() );
+	}
+
+	int count = (int)values.size() / 3;
+	points->resize( count );
+	for ( int i = 0; i < count; ++i )
+	{
+		( *points )[i] = { values[3 * i], values[3 * i + 1], values[3 * i + 2] };
+	}
+
+	return count > 0;
+}
 
 class HullCrash : public Sample
 {
@@ -138,59 +286,17 @@ public:
 	explicit HullCrash( SampleContext* context )
 		: Sample( context )
 	{
+		m_hull = nullptr;
+		m_sourceIndex = 3;
+		m_maxVertexCount = B3_MAX_HULL_VERTICES;
+
+		LoadPoints();
+		CreateHull();
+
 		if ( m_context->restart == false )
 		{
-			m_camera->SetView( 0.0f, 15.0f, 5.0f, b3Pos_zero );
+			FrameView();
 		}
-
-		m_hull = nullptr;
-
-#if 0
-		// bad hull SM_Waterfall_MED_Wide_01
-		b3Vec3 points[] = {
-			{ 0.100183107, -498.925385, -1275.39966 }, { 0.100183107, -498.925415, 0.125000000 },
-			{ 0.100183107, 486.343750, 0.125000000 },  { 0.100183107, 486.343719, -1275.39966 },
-			{ -395.117462, 486.343781, -1462.43750 },  { -395.117462, 486.343750, -96.7426758 },
-			{ -395.117462, -498.925415, -96.7424469 }, { -395.117462, -498.925446, -1462.52612 },
-			{ -186.979691, 486.294891, -1462.47949 },  { -298.250000, 486.294891, 0.125000000 },
-			{ -395.121216, 486.294891, -1462.52612 },  { -186.984360, -498.913361, -1462.48413 },
-			{ -298.250000, -498.913361, 0.125000000 },
-		};
-
-#elif 1
-		b3Vec3 points[] = {
-			{ 100.000000, -142.292389, 130.826111 },  { 99.5354385, -71.3011093, 130.826111 },
-			{ 99.5930862, -80.1112213, -100.000000 }, { 100.000000, -142.292389, -100.000000 },
-			{ 99.5930862, -80.1112213, 130.826111 },
-		};
-#else
-		b3Vec3 points[] = {
-			{ -11.3861933, -24.2451687, -12.0037909 }, { -11.3889809, -24.2466526, -11.9013014 },
-			{ -11.3804407, -24.3151531, -12.0046492 }, { -11.3832273, -24.3166409, -11.9021587 },
-			{ -14.4396200, -24.3636723, -12.1324549 }, { -14.4432650, -24.3655701, -12.0299988 },
-			{ -14.4356947, -24.4337788, -12.1336164 }, { -14.4393377, -24.4356804, -12.0311594 },
-		};
-#endif
-
-		static_assert( sizeof( points ) / sizeof( points[0] ) < m_capacity, "bad" );
-
-		m_count = sizeof( points ) / sizeof( points[0] );
-		for ( int i = 0; i < m_count; ++i )
-		{
-			m_points[i] = 0.01f * points[i];
-		}
-
-		// This shift shouldn't be necessary but I'm doing it so the hull
-		// appears on the screen.
-		// for ( int i = 0; i < m_count; ++i )
-		//{
-		//	m_points[i] -= m_points[0];
-		//	m_points[i] *= 0.01f;
-		//}
-
-		m_hull = b3CreateHull( m_points, m_count, m_count );
-
-		(void)m_hull;
 	}
 
 	~HullCrash() override
@@ -201,6 +307,95 @@ public:
 		}
 	}
 
+	void LoadPoints()
+	{
+		const HullSource& source = hullSources[m_sourceIndex];
+		if ( source.points != nullptr )
+		{
+			m_points.assign( source.points, source.points + source.count );
+		}
+		else
+		{
+			char path[64];
+			snprintf( path, sizeof( path ), "data/hulls/%s", source.name );
+			LoadHullPoints( path, &m_points );
+		}
+
+		for ( b3Vec3& point : m_points )
+		{
+			point = source.scale * point;
+		}
+
+		// The reported failure used the point count as the limit
+		m_maxVertexCount = b3ClampInt( (int)m_points.size(), 4, B3_MAX_HULL_VERTICES );
+	}
+
+	void CreateHull()
+	{
+		if ( m_hull != nullptr )
+		{
+			b3DestroyHull( m_hull );
+			m_hull = nullptr;
+		}
+
+		int count = (int)m_points.size();
+		if ( count >= 4 )
+		{
+			m_hull = b3CreateHull( m_points.data(), count, m_maxVertexCount );
+		}
+	}
+
+	void FrameView()
+	{
+		if ( m_points.empty() )
+		{
+			return;
+		}
+
+		b3AABB bounds = b3MakeAABB( m_points.data(), (int)m_points.size(), 0.0f );
+		float radius = b3Length( b3AABB_Extents( bounds ) );
+		m_camera->SetView( 0.0f, 15.0f, b3MaxFloat( 3.0f * radius, 1.0f ),
+						   b3ToPos( b3AABB_Center( bounds ) ) );
+	}
+
+	bool DrawControls() override
+	{
+		DrawTextLine( "points = %d", (int)m_points.size() );
+
+		if ( m_hull != nullptr )
+		{
+			DrawTextLine( "hull: vertices = %d, edges = %d, faces = %d", m_hull->vertexCount,
+						  m_hull->edgeCount / 2, m_hull->faceCount );
+		}
+		else
+		{
+			DrawTextLine( "hull creation failed" );
+		}
+
+		if ( ImGui::BeginCombo( "Source", hullSources[m_sourceIndex].name ) )
+		{
+			for ( int i = 0; i < hullSourceCount; ++i )
+			{
+				if ( ImGui::Selectable( hullSources[i].name, i == m_sourceIndex ) )
+				{
+					m_sourceIndex = i;
+					LoadPoints();
+					CreateHull();
+					FrameView();
+				}
+			}
+
+			ImGui::EndCombo();
+		}
+
+		if ( ImGui::SliderInt( "Max Vertices", &m_maxVertexCount, 4, B3_MAX_HULL_VERTICES ) )
+		{
+			CreateHull();
+		}
+
+		return true;
+	}
+
 	void Render() override
 	{
 		if ( m_hull != nullptr )
@@ -209,9 +404,9 @@ public:
 		}
 		else
 		{
-			for ( int i = 0; i < m_count; ++i )
+			for ( const b3Vec3& point : m_points )
 			{
-				DrawPoint( b3ToPos( m_points[i] ), 5.0f, MakeColor( b3_colorWhite ) );
+				DrawPoint( b3ToPos( point ), 5.0f, MakeColor( b3_colorWhite ) );
 			}
 		}
 
@@ -225,10 +420,10 @@ public:
 		return new HullCrash( sampleContext );
 	}
 
-	static constexpr int m_capacity = 64;
+	std::vector<b3Vec3> m_points;
 	b3HullData* m_hull;
-	b3Vec3 m_points[m_capacity];
-	int m_count;
+	int m_sourceIndex;
+	int m_maxVertexCount;
 };
 
 static int sampleHullCrash = RegisterSample( "Issues", "Hull Crash", HullCrash::Create );
@@ -242,7 +437,6 @@ public:
 		if ( context->restart == false )
 		{
 			m_camera->SetView( 0.0f, 15.0f, 10.0f, { 0.0f, 2.0f, 0.0f } );
-			
 		}
 
 		AddGroundBox( 10.0f );
@@ -361,11 +555,11 @@ public:
 
 			b3ShapeDef shapeDef = b3DefaultShapeDef();
 			m_heightField = b3CreateGrid( 40, 40, { 0.5f, 1.0f, 0.5f }, false );
-			//m_heightField = b3CreateWave( 40, 40, {1.0f, 2.0f, 1.0f}, 0.02f, 0.04f, false );
+			// m_heightField = b3CreateWave( 40, 40, {1.0f, 2.0f, 1.0f}, 0.02f, 0.04f, false );
 			b3CreateHeightFieldShape( groundId, &shapeDef, m_heightField );
 
 			m_gridMesh = b3CreateGridMesh( 40, 40, 0.5f, 1, true );
-			//b3CreateMeshShape( groundId, &shapeDef, m_gridMesh, b3Vec3_one );
+			// b3CreateMeshShape( groundId, &shapeDef, m_gridMesh, b3Vec3_one );
 		}
 
 		{
@@ -444,6 +638,7 @@ public:
 
 		// --- Building mesh on top of ground ---
 		m_building = CreateMeshData( "data/meshes/building.obj", 1.0f, false, false, true, true );
+		if ( m_building != nullptr )
 		{
 			b3BodyDef bodyDef = b3DefaultBodyDef();
 			bodyDef.position = { 0.0f, 0.1f, 0.0f };
@@ -491,7 +686,6 @@ public:
 };
 
 static int sampleIndex = RegisterSample( "Issues", "Capsule Mesh", CapsuleMeshBug::Create );
-
 
 // Reproduces s&box rigid body character ghost collisions on a FLAT floor.
 //
@@ -542,10 +736,12 @@ public:
 			m_camera->SetView( 90.0f, 25.0f, 10.0f, { 0.0f, 1.0f, 0.0f } );
 		}
 
-		// Two chunks meeting at x = 0, each its own body and mesh shape, so seam contacts live
-		// in separate contact pairs like s&box world mesh chunks. A beam top straddles the seam.
-		CreateFloorChunk( 0, -(float)m_halfLengthU, 0.0f );
-		CreateFloorChunk( 1, 0.0f, (float)m_halfLengthU );
+		m_fixWinding = true;
+		m_combineChunks = true;
+		m_remesh = true;
+		m_simplifyErrorMillimeters = 10.0f;
+		m_repeatSimplify = true;
+		CreateFloor();
 
 		// Character
 		{
@@ -556,19 +752,25 @@ public:
 			bodyDef.motionLocks.angularY = true;
 			bodyDef.motionLocks.angularZ = true;
 			bodyDef.enableSleep = false;
-			bodyDef.enableContactRecycling = false;
+
+			// With current ghost mitigation this seems unnecessary
+			//bodyDef.enableContactRecycling = false;
+
 			bodyDef.gravityScale = 2.03f; // s&box gravity: 800 inch/s^2
 			bodyDef.name = "character";
+			bodyDef.safetyFactor = 0.05f;
 			m_characterId = b3CreateBody( m_worldId, &bodyDef );
 
 			b3ShapeDef shapeDef = b3DefaultShapeDef();
 			shapeDef.baseMaterial.friction = 0.0f;
 			shapeDef.baseMaterial.restitution = 0.0f;
-			//shapeDef.baseMaterial.customColor = b3_colorLimeGreen;
+			// shapeDef.baseMaterial.customColor = b3_colorLimeGreen;
 
 			float volume = 8.0f * m_bodyHalfWidth * m_bodyHalfHeight * m_bodyHalfWidth;
 			shapeDef.density = m_characterMass / volume;
-			shapeDef.enableSpeculativeContact = false;
+
+			// With current ghost mitigation this seems unnecessary
+			//shapeDef.enableSpeculativeContact = false;
 
 			b3BoxHull box = b3MakeBoxHull( m_bodyHalfWidth, m_bodyHalfHeight, m_bodyHalfWidth );
 			b3CreateHullShape( m_characterId, &shapeDef, &box.base );
@@ -588,8 +790,45 @@ public:
 
 	~SBoxGhostCollisions() override
 	{
-		b3DestroyMesh( m_chunkMesh[0] );
-		b3DestroyMesh( m_chunkMesh[1] );
+		for ( int i = 0; i < 2; ++i )
+		{
+			if ( m_chunkMesh[i] != nullptr )
+			{
+				b3DestroyMesh( m_chunkMesh[i] );
+			}
+		}
+	}
+
+	void CreateFloor()
+	{
+		m_chunkTriangleCount[1] = 0;
+		m_simplifyPassCount[1] = 0;
+
+		if ( m_combineChunks )
+		{
+			CreateFloorChunk( 0, -(float)m_halfLengthU, (float)m_halfLengthU );
+			return;
+		}
+
+		// Two chunks meeting at x = 0, each its own body and mesh shape, so seam contacts live
+		// in separate contact pairs like s&box world mesh chunks. A beam top straddles the seam.
+		CreateFloorChunk( 0, -(float)m_halfLengthU, 0.0f );
+		CreateFloorChunk( 1, 0.0f, (float)m_halfLengthU );
+	}
+
+	void DestroyFloor()
+	{
+		for ( int i = 0; i < 2; ++i )
+		{
+			if ( B3_IS_NON_NULL( m_chunkBodyIds[i] ) )
+			{
+				b3DestroyBody( m_chunkBodyIds[i] );
+				b3DestroyMesh( m_chunkMesh[i] );
+			}
+
+			m_chunkBodyIds[i] = b3_nullBodyId;
+			m_chunkMesh[i] = nullptr;
+		}
 	}
 
 	// Deterministic integer hash for tile tessellation selection
@@ -603,7 +842,8 @@ public:
 		return x;
 	}
 
-	static void EmitTriangle( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, b3Vec3 a, b3Vec3 b, b3Vec3 c )
+	static void EmitTriangle( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices,
+							  b3Vec3 a, b3Vec3 b, b3Vec3 c )
 	{
 		int32_t base = (int32_t)vertices.size();
 		vertices.push_back( a );
@@ -615,8 +855,8 @@ public:
 	}
 
 	// Horizontal patch at height y spanning [x0,x1]x[z0,z1] (inches), normal +y
-	static void EmitPatch( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float x0, float x1, float z0, float z1,
-						   float y, float cell )
+	static void EmitPatch( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float x0,
+						   float x1, float z0, float z1, float y, float cell )
 	{
 		if ( x1 - x0 < 0.01f )
 		{
@@ -656,41 +896,59 @@ public:
 	}
 
 	// Sloped strip from edge (xLow, yLow) to edge (xHigh, yHigh) spanning the full z width
-	static void EmitSlope( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float xLow, float yLow, float xHigh,
-						   float yHigh, float zCell )
+	static void EmitSlope( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float xLow,
+						   float yLow, float xHigh, float yHigh, float zCell, bool fixWinding )
 	{
+		// The original winding only faces out for a slope rising toward +x
+		bool flip = fixWinding && xHigh < xLow;
+
 		int countZ = (int)( 2.0f * (float)m_halfWidthU / zCell + 0.99f );
 		for ( int iz = 0; iz < countZ; ++iz )
 		{
-			float z0 = -(float)m_halfWidthU + 2.0f * (float)m_halfWidthU * (float)iz / (float)countZ;
-			float z1 = -(float)m_halfWidthU + 2.0f * (float)m_halfWidthU * (float)( iz + 1 ) / (float)countZ;
+			float z0 =
+				-(float)m_halfWidthU + 2.0f * (float)m_halfWidthU * (float)iz / (float)countZ;
+			float z1 = -(float)m_halfWidthU +
+					   2.0f * (float)m_halfWidthU * (float)( iz + 1 ) / (float)countZ;
 
 			b3Vec3 l0 = { SRC * xLow, SRC * yLow, SRC * z0 };
 			b3Vec3 l1 = { SRC * xLow, SRC * yLow, SRC * z1 };
 			b3Vec3 h0 = { SRC * xHigh, SRC * yHigh, SRC * z0 };
 			b3Vec3 h1 = { SRC * xHigh, SRC * yHigh, SRC * z1 };
 
-			EmitTriangle( vertices, indices, l0, l1, h1 );
-			EmitTriangle( vertices, indices, l0, h1, h0 );
+			if ( flip )
+			{
+				EmitTriangle( vertices, indices, l0, h1, l1 );
+				EmitTriangle( vertices, indices, l0, h0, h1 );
+			}
+			else
+			{
+				EmitTriangle( vertices, indices, l0, l1, h1 );
+				EmitTriangle( vertices, indices, l0, h1, h0 );
+			}
 		}
 	}
 
 	// Vertical wall at x from y0 (bottom) to y1 (top). facing = +1 faces +x, -1 faces -x
-	static void EmitWall( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float x, float y0, float y1, int facing,
-						  float zCell )
+	static void EmitWall( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices, float x,
+						  float y0, float y1, int facing, float zCell, bool fixWinding )
 	{
+		// The original winding faced every wall into the solid
+		bool faceNegativeX = fixWinding ? facing < 0 : facing > 0;
+
 		int countZ = (int)( 2.0f * (float)m_halfWidthU / zCell + 0.99f );
 		for ( int iz = 0; iz < countZ; ++iz )
 		{
-			float z0 = -(float)m_halfWidthU + 2.0f * (float)m_halfWidthU * (float)iz / (float)countZ;
-			float z1 = -(float)m_halfWidthU + 2.0f * (float)m_halfWidthU * (float)( iz + 1 ) / (float)countZ;
+			float z0 =
+				-(float)m_halfWidthU + 2.0f * (float)m_halfWidthU * (float)iz / (float)countZ;
+			float z1 = -(float)m_halfWidthU +
+					   2.0f * (float)m_halfWidthU * (float)( iz + 1 ) / (float)countZ;
 
 			b3Vec3 b0 = { SRC * x, SRC * y0, SRC * z0 };
 			b3Vec3 b1 = { SRC * x, SRC * y0, SRC * z1 };
 			b3Vec3 t0 = { SRC * x, SRC * y1, SRC * z0 };
 			b3Vec3 t1 = { SRC * x, SRC * y1, SRC * z1 };
 
-			if ( facing > 0 )
+			if ( faceNegativeX )
 			{
 				EmitTriangle( vertices, indices, b0, b1, t1 );
 				EmitTriangle( vertices, indices, b0, t1, t0 );
@@ -711,6 +969,60 @@ public:
 		return *o1 - *o0 > 0.01f;
 	}
 
+	// Weld exact duplicates, then let meshoptimizer collapse every edge that leaves the surface in
+	// place. A t-junction vertex sits on an open border, so it can slide along that border onto a
+	// corner, which closes the seam. Flat collapses still cost a little from the simplifier's
+	// vertex regularization, so the error limit has to clear that while staying far below the inch
+	// scale cost of collapsing a real crease. Regularize options raise that cost. Vertex kinds are
+	// fixed per call, so a corner locked by a t-junction stays locked after its seam closes.
+	// Repeating reclassifies, but the error limit applies per pass, so deviation can accumulate.
+	// Winding is not repaired. Returns the number of passes.
+	static int Remesh( std::vector<b3Vec3>& vertices, std::vector<int32_t>& indices,
+					   float errorLimit, unsigned int options, bool repeat )
+	{
+		size_t indexCount = indices.size();
+		const unsigned int* sourceIndices = reinterpret_cast<const unsigned int*>( indices.data() );
+
+		std::vector<unsigned int> remap( vertices.size() );
+		size_t vertexCount =
+			meshopt_generateVertexRemap( remap.data(), sourceIndices, indexCount, vertices.data(),
+										 vertices.size(), sizeof( b3Vec3 ) );
+
+		std::vector<unsigned int> welded( indexCount );
+		meshopt_remapIndexBuffer( welded.data(), sourceIndices, indexCount, remap.data() );
+
+		std::vector<b3Vec3> positions( vertexCount );
+		meshopt_remapVertexBuffer( positions.data(), vertices.data(), vertices.size(),
+								   sizeof( b3Vec3 ), remap.data() );
+
+		std::vector<unsigned int> simplified( indexCount );
+		int passCount = 0;
+		for ( ;; )
+		{
+			size_t simplifiedCount = meshopt_simplify(
+				simplified.data(), welded.data(), welded.size(), &positions[0].x, vertexCount,
+				sizeof( b3Vec3 ), 0, errorLimit, meshopt_SimplifyErrorAbsolute | options, nullptr );
+			passCount += 1;
+
+			bool reduced = simplifiedCount < welded.size();
+			welded.assign( simplified.begin(), simplified.begin() + simplifiedCount );
+
+			if ( repeat == false || reduced == false )
+			{
+				break;
+			}
+		}
+
+		size_t usedCount =
+			meshopt_optimizeVertexFetch( positions.data(), welded.data(), welded.size(),
+										 positions.data(), vertexCount, sizeof( b3Vec3 ) );
+		positions.resize( usedCount );
+
+		vertices = positions;
+		indices.assign( welded.begin(), welded.end() );
+		return passCount;
+	}
+
 	void CreateFloorChunk( int chunk, float x0U, float x1U )
 	{
 		std::vector<b3Vec3> vertices;
@@ -721,7 +1033,8 @@ public:
 		// --- Concrete slabs at y = 0 outside the beam region ---
 		// Tiles tessellate at a hash-picked resolution so neighbors meet with T-junctions,
 		// like cooked s&box map collision.
-		float slabSpans[2][2] = { { -(float)m_halfLengthU, m_beamRegion0 }, { m_beamRegion1, (float)m_halfLengthU } };
+		float slabSpans[2][2] = { { -(float)m_halfLengthU, m_beamRegion0 },
+								  { m_beamRegion1, (float)m_halfLengthU } };
 		for ( int i = 0; i < 2; ++i )
 		{
 			if ( ClipSpan( slabSpans[i][0], slabSpans[i][1], x0U, x1U, &s0, &s1 ) == false )
@@ -734,10 +1047,15 @@ public:
 				float tx1 = b3MinFloat( tx + (float)m_tileSizeU, s1 );
 				for ( int tz = -m_halfWidthU; tz < m_halfWidthU; tz += m_tileSizeU )
 				{
-					uint32_t h = Hash( (uint32_t)( (int)tx * 73856093 ) ^ (uint32_t)( tz * 19349663 ) ^
-									   (uint32_t)( chunk * 2654435761u ) );
+					// Seeded by side rather than chunk so combined and split floors tessellate the
+					// same
+					uint32_t side = tx < 0.0f ? 0u : 1u;
+					uint32_t h =
+						Hash( (uint32_t)( (int)tx * 73856093 ) ^ (uint32_t)( tz * 19349663 ) ^
+							  (uint32_t)( side * 2654435761u ) );
 					float cells[3] = { 4.0f, 8.0f, 16.0f };
-					EmitPatch( vertices, indices, tx, tx1, (float)tz, (float)( tz + m_tileSizeU ), 0.0f, cells[h % 3] );
+					EmitPatch( vertices, indices, tx, tx1, (float)tz, (float)( tz + m_tileSizeU ),
+							   0.0f, cells[h % 3] );
 				}
 			}
 		}
@@ -745,6 +1063,9 @@ public:
 		// --- Beam section: flat tops at y = 0, chamfers dropping to pits ---
 		float pitTop = -m_chamferDropU;
 		float pitBottom = -m_pitDepthU;
+
+		// Coarse walls and pit floors leave t-junctions against the 8 inch chamfer cells
+		float wellCell = 16.0f;
 
 		for ( int k = 0; k < m_beamCount; ++k )
 		{
@@ -757,17 +1078,20 @@ public:
 			float top1 = pitRight ? bx + m_beamWidthU - m_chamferWidthU : bx + m_beamWidthU;
 			if ( ClipSpan( top0, top1, x0U, x1U, &s0, &s1 ) )
 			{
-				EmitPatch( vertices, indices, s0, s1, -(float)m_halfWidthU, (float)m_halfWidthU, 0.0f, 8.0f );
+				EmitPatch( vertices, indices, s0, s1, -(float)m_halfWidthU, (float)m_halfWidthU,
+						   0.0f, 8.0f );
 			}
 
 			// Chamfers sloping below the walkable plane
 			if ( pitLeft && bx >= x0U && bx < x1U )
 			{
-				EmitSlope( vertices, indices, bx, pitTop, bx + m_chamferWidthU, 0.0f, 8.0f );
+				EmitSlope( vertices, indices, bx, pitTop, bx + m_chamferWidthU, 0.0f, 8.0f,
+						   m_fixWinding );
 			}
 			if ( pitRight && bx + m_beamWidthU > x0U && bx + m_beamWidthU <= x1U )
 			{
-				EmitSlope( vertices, indices, bx + m_beamWidthU, pitTop, bx + m_beamWidthU - m_chamferWidthU, 0.0f, 8.0f );
+				EmitSlope( vertices, indices, bx + m_beamWidthU, pitTop,
+						   bx + m_beamWidthU - m_chamferWidthU, 0.0f, 8.0f, m_fixWinding );
 			}
 
 			// Pit to the right of this beam
@@ -777,18 +1101,29 @@ public:
 				float pitR = bx + m_beamPitchU;
 				if ( pitL >= x0U && pitL < x1U )
 				{
-					EmitWall( vertices, indices, pitL, pitBottom, pitTop, +1, 16.0f );
+					EmitWall( vertices, indices, pitL, pitBottom, pitTop, +1, wellCell,
+							  m_fixWinding );
 				}
 				if ( pitR > x0U && pitR <= x1U )
 				{
-					EmitWall( vertices, indices, pitR, pitBottom, pitTop, -1, 16.0f );
+					EmitWall( vertices, indices, pitR, pitBottom, pitTop, -1, wellCell,
+							  m_fixWinding );
 				}
 				if ( ClipSpan( pitL, pitR, x0U, x1U, &s0, &s1 ) )
 				{
-					EmitPatch( vertices, indices, s0, s1, -(float)m_halfWidthU, (float)m_halfWidthU, pitBottom, 16.0f );
+					EmitPatch( vertices, indices, s0, s1, -(float)m_halfWidthU, (float)m_halfWidthU,
+							   pitBottom, wellCell );
 				}
 			}
 		}
+
+		if ( m_remesh )
+		{
+			m_simplifyPassCount[chunk] = Remesh(
+				vertices, indices, 0.001f * m_simplifyErrorMillimeters, 0, m_repeatSimplify );
+		}
+
+		m_chunkTriangleCount[chunk] = (int)( indices.size() / 3 );
 
 		b3MeshDef meshDef = {};
 		meshDef.vertices = vertices.data();
@@ -802,10 +1137,10 @@ public:
 		m_chunkMesh[chunk] = b3CreateMesh( &meshDef, nullptr, 0 );
 
 		b3BodyDef bodyDef = b3DefaultBodyDef();
-		b3BodyId body = b3CreateBody( m_worldId, &bodyDef );
+		m_chunkBodyIds[chunk] = b3CreateBody( m_worldId, &bodyDef );
 
 		b3ShapeDef shapeDef = b3DefaultShapeDef();
-		b3CreateMeshShape( body, &shapeDef, m_chunkMesh[chunk], b3Vec3_one );
+		b3CreateMeshShape( m_chunkBodyIds[chunk], &shapeDef, m_chunkMesh[chunk], b3Vec3_one );
 	}
 
 	void Step() override
@@ -828,7 +1163,7 @@ public:
 		}
 		else if ( position.z < -m_walkRangeZ )
 		{
-			m_walkDirectionZ= 1.0f;
+			m_walkDirectionZ = 1.0f;
 		}
 
 		b3Vec3 velocity = b3Body_GetLinearVelocity( m_characterId );
@@ -870,9 +1205,25 @@ public:
 		}
 
 		b3Vec3 currentVelocity = b3Body_GetLinearVelocity( m_characterId );
-		DrawTextLine( "ghost launches: %d, worst: %.2f m/s (%.0f inch/s)", m_launchCount, m_maxLaunchSpeed,
-					  m_maxLaunchSpeed / SRC );
+		DrawTextLine( "ghost launches: %d, worst: %.2f m/s (%.0f inch/s)", m_launchCount,
+					  m_maxLaunchSpeed, m_maxLaunchSpeed / SRC );
 		DrawTextLine( "vertical velocity: %.2f m/s", currentVelocity.y );
+		if ( m_combineChunks )
+		{
+			DrawTextLine( "floor triangles: %d", m_chunkTriangleCount[0] );
+		}
+		else
+		{
+			DrawTextLine( "floor triangles: %d (chunks %d + %d)",
+						  m_chunkTriangleCount[0] + m_chunkTriangleCount[1],
+						  m_chunkTriangleCount[0], m_chunkTriangleCount[1] );
+		}
+
+		if ( m_remesh )
+		{
+			DrawTextLine( m_combineChunks ? "simplify passes: %d" : "simplify passes: %d + %d",
+						  m_simplifyPassCount[0], m_simplifyPassCount[1] );
+		}
 	}
 
 	bool DrawControls() override
@@ -889,7 +1240,24 @@ public:
 			m_walkSpeedZ = speedUZ * SRC;
 		}
 
-		if ( ImGui::Button( "Reset Counters" ) )
+		bool rebuild = ImGui::Checkbox( "Fix Winding", &m_fixWinding );
+		rebuild = ImGui::Checkbox( "Combine Chunks", &m_combineChunks ) || rebuild;
+		rebuild = ImGui::Checkbox( "Remesh (meshoptimizer)", &m_remesh ) || rebuild;
+
+		ImGui::SliderFloat( "Simplify Error (mm)", &m_simplifyErrorMillimeters, 0.1f, 50.0f, "%.1f",
+							ImGuiSliderFlags_Logarithmic );
+		rebuild = ( ImGui::IsItemDeactivatedAfterEdit() && m_remesh ) || rebuild;
+
+		rebuild =
+			( ImGui::Checkbox( "Repeat Simplify", &m_repeatSimplify ) && m_remesh ) || rebuild;
+
+		if ( rebuild )
+		{
+			DestroyFloor();
+			CreateFloor();
+		}
+
+		if ( ImGui::Button( "Reset Counters" ) || rebuild )
 		{
 			m_launchCount = 0;
 			m_maxLaunchSpeed = 0.0f;
@@ -905,12 +1273,21 @@ public:
 		return new SBoxGhostCollisions( context );
 	}
 
-	static constexpr float m_walkRangeX = 3.5f;		 // turn around beyond +/- this x (meters)
-	static constexpr float m_walkRangeZ = 0.5f;		 // turn around beyond +/- this x (meters)
-	static constexpr float m_launchThreshold = 0.5f; // upward m/s counted as a ghost launch (~20 inch/s)
+	static constexpr float m_walkRangeX = 3.5f; // turn around beyond +/- this x (meters)
+	static constexpr float m_walkRangeZ = 0.5f; // turn around beyond +/- this x (meters)
+	static constexpr float m_launchThreshold =
+		0.5f; // upward m/s counted as a ghost launch (~20 inch/s)
 	static constexpr int m_markerCapacity = 64;
 
 	b3MeshData* m_chunkMesh[2] = {};
+	b3BodyId m_chunkBodyIds[2] = { b3_nullBodyId, b3_nullBodyId };
+	bool m_fixWinding;
+	bool m_combineChunks;
+	bool m_remesh;
+	float m_simplifyErrorMillimeters;
+	bool m_repeatSimplify;
+	int m_simplifyPassCount[2] = {};
+	int m_chunkTriangleCount[2] = {};
 	b3BodyId m_characterId;
 	float m_walkDirectionX;
 	float m_walkDirectionZ;
@@ -923,115 +1300,169 @@ public:
 	int m_launchMarkerCount;
 };
 
-static int sampleSBoxGhostCollisions = RegisterSample( "Issues", "s&box Ghost Collisions", SBoxGhostCollisions::Create );
+static int sampleSBoxGhostCollisions =
+	RegisterSample( "Issues", "s&box Ghost Collisions", SBoxGhostCollisions::Create );
 
 static const b3Vec3 s_metalWheel1Verts[317] = {
-	{ 0.010279f, 0.086341f, 0.051768f },	{ -0.010314f, -0.084708f, 0.051804f },	{ 0.010279f, -0.084708f, 0.051768f },
-	{ -0.010314f, 0.086341f, 0.051804f },	{ 0.029138f, -0.084708f, -0.043911f },	{ 0.043724f, -0.084708f, -0.029376f },
-	{ 0.010098f, -0.084708f, -0.051759f },	{ -0.010494f, -0.084708f, -0.051723f }, { 0.051638f, -0.084708f, -0.010364f },
-	{ 0.051674f, -0.084708f, 0.010229f },	{ 0.043827f, -0.084708f, 0.029268f },	{ 0.029291f, -0.084708f, 0.043855f },
-	{ -0.029353f, -0.084708f, 0.043957f },	{ -0.051889f, -0.084708f, -0.010183f }, { -0.051853f, -0.084708f, 0.010409f },
-	{ -0.043939f, -0.084708f, 0.029421f },	{ -0.029506f, -0.084708f, -0.043809f }, { -0.044042f, -0.084708f, -0.029222f },
-	{ -0.029353f, 0.086341f, 0.043957f },	{ 0.043724f, 0.086341f, -0.029376f },	{ 0.029138f, 0.086341f, -0.043911f },
-	{ 0.010098f, 0.086341f, -0.051759f },	{ 0.051638f, 0.086341f, -0.010364f },	{ 0.051674f, 0.086341f, 0.010229f },
-	{ -0.044042f, 0.086341f, -0.029222f },	{ 0.043827f, 0.086341f, 0.029268f },	{ -0.051889f, 0.086341f, -0.010183f },
-	{ -0.043939f, 0.086341f, 0.029421f },	{ -0.029506f, 0.086341f, -0.043809f },	{ 0.035354f, 0.070897f, 0.035658f },
-	{ 0.035354f, -0.069397f, 0.035658f },	{ -0.035498f, 0.070897f, 0.035658f },	{ -0.035498f, -0.069397f, 0.035658f },
-	{ 0.035354f, -0.069397f, 0.365503f },	{ 0.035354f, 0.070897f, 0.365503f },	{ -0.035498f, 0.070897f, 0.365503f },
-	{ -0.035498f, -0.069397f, 0.365503f },	{ 0.035354f, 0.070897f, -0.365033f },	{ 0.035354f, -0.069397f, -0.365033f },
-	{ -0.035498f, 0.070897f, -0.365033f },	{ -0.035498f, -0.069397f, -0.365033f }, { 0.035354f, -0.069397f, -0.035187f },
-	{ 0.035354f, 0.070897f, -0.035187f },	{ -0.035498f, 0.070897f, -0.035187f },	{ -0.035498f, -0.069397f, -0.035187f },
-	{ -0.035494f, -0.069397f, -0.035191f }, { -0.365340f, -0.069397f, -0.035191f }, { -0.035494f, 0.070897f, -0.035191f },
-	{ -0.365340f, 0.070897f, -0.035191f },	{ -0.365340f, -0.069397f, 0.035661f },	{ -0.035494f, -0.069397f, 0.035661f },
-	{ -0.035494f, 0.070897f, 0.035661f },	{ -0.365340f, 0.070897f, 0.035661f },	{ 0.035350f, 0.070897f, -0.035191f },
-	{ 0.365196f, 0.070897f, -0.035191f },	{ 0.035350f, -0.069397f, -0.035191f },	{ 0.365196f, -0.069397f, -0.035191f },
-	{ 0.365196f, 0.070897f, 0.035661f },	{ 0.035350f, 0.070897f, 0.035661f },	{ 0.035350f, -0.069397f, 0.035661f },
-	{ 0.365196f, -0.069397f, 0.035661f },	{ -0.070802f, 0.086337f, 0.355420f },	{ -0.070802f, -0.084705f, 0.355420f },
-	{ -0.097081f, 0.086335f, 0.487537f },	{ -0.097081f, -0.084704f, 0.487537f },	{ -0.000108f, 0.086337f, 0.362383f },
-	{ -0.000108f, 0.086335f, 0.497088f },	{ -0.000108f, -0.084704f, 0.497088f },	{ -0.000108f, -0.084705f, 0.362383f },
-	{ -0.138787f, -0.084705f, 0.334799f },	{ -0.138787f, 0.086337f, 0.334799f },	{ -0.070810f, -0.084705f, 0.355419f },
-	{ -0.070810f, 0.086337f, 0.355419f },	{ -0.097090f, 0.086335f, 0.487536f },	{ -0.190336f, 0.086335f, 0.459250f },
-	{ -0.190336f, -0.084704f, 0.459250f },	{ -0.097090f, -0.084704f, 0.487536f },	{ -0.138795f, 0.086337f, 0.334796f },
-	{ -0.138795f, -0.084705f, 0.334796f },	{ -0.201442f, 0.086337f, 0.301310f },	{ -0.201442f, -0.084705f, 0.301310f },
-	{ -0.276280f, -0.084704f, 0.413313f },	{ -0.276280f, 0.086335f, 0.413313f },	{ -0.190344f, 0.086335f, 0.459247f },
-	{ -0.190344f, -0.084704f, 0.459247f },	{ -0.201450f, -0.084705f, 0.301306f },	{ -0.256361f, -0.084705f, 0.256241f },
-	{ -0.201450f, 0.086337f, 0.301306f },	{ -0.256361f, 0.086337f, 0.256241f },	{ -0.351612f, 0.086335f, 0.351492f },
-	{ -0.351612f, -0.084704f, 0.351492f },	{ -0.276288f, 0.086335f, 0.413309f },	{ -0.276288f, -0.084704f, 0.413309f },
-	{ -0.301431f, -0.084705f, 0.201325f },	{ -0.413435f, -0.084704f, 0.276163f },	{ -0.413435f, 0.086335f, 0.276163f },
-	{ -0.301431f, 0.086337f, 0.201325f },	{ -0.256367f, -0.084705f, 0.256236f },	{ -0.256367f, 0.086337f, 0.256236f },
-	{ -0.351618f, 0.086335f, 0.351487f },	{ -0.351618f, -0.084704f, 0.351487f },	{ -0.334922f, -0.084705f, 0.138670f },
-	{ -0.459374f, -0.084704f, 0.190220f },	{ -0.459374f, 0.086335f, 0.190220f },	{ -0.334922f, 0.086337f, 0.138670f },
-	{ -0.301436f, 0.086337f, 0.201318f },	{ -0.301436f, -0.084705f, 0.201318f },	{ -0.413440f, 0.086335f, 0.276156f },
-	{ -0.413440f, -0.084704f, 0.276156f },	{ -0.487663f, -0.084704f, 0.096966f },	{ -0.355546f, -0.084705f, 0.070686f },
-	{ -0.459377f, -0.084704f, 0.190212f },	{ -0.334926f, -0.084705f, 0.138663f },	{ -0.355546f, 0.086337f, 0.070686f },
-	{ -0.334926f, 0.086337f, 0.138663f },	{ -0.487663f, 0.086335f, 0.096966f },	{ -0.459377f, 0.086335f, 0.190212f },
-	{ -0.362511f, -0.084705f, -0.000016f }, { -0.355549f, -0.084705f, 0.070678f },	{ -0.497217f, -0.084704f, -0.000016f },
-	{ -0.487665f, -0.084704f, 0.096957f },	{ -0.497217f, 0.086335f, -0.000016f },	{ -0.362511f, 0.086337f, -0.000016f },
-	{ -0.355549f, 0.086337f, 0.070678f },	{ -0.487665f, 0.086335f, 0.096957f },	{ -0.362512f, 0.086337f, -0.000024f },
-	{ -0.362512f, -0.084705f, -0.000024f }, { -0.355549f, 0.086337f, -0.070717f },	{ -0.355549f, -0.084705f, -0.070717f },
-	{ -0.497217f, -0.084704f, -0.000024f }, { -0.487666f, -0.084704f, -0.096997f }, { -0.497217f, 0.086335f, -0.000024f },
-	{ -0.487666f, 0.086335f, -0.096997f },	{ -0.334927f, -0.084705f, -0.138702f }, { -0.355548f, 0.086337f, -0.070726f },
-	{ -0.355548f, -0.084705f, -0.070726f }, { -0.334927f, 0.086337f, -0.138702f },	{ -0.487665f, -0.084704f, -0.097005f },
-	{ -0.459379f, -0.084704f, -0.190252f }, { -0.487665f, 0.086335f, -0.097005f },	{ -0.459379f, 0.086335f, -0.190252f },
-	{ -0.413442f, -0.084704f, -0.276196f }, { -0.301439f, -0.084705f, -0.201358f }, { -0.334925f, -0.084705f, -0.138710f },
-	{ -0.459376f, -0.084704f, -0.190260f }, { -0.334925f, 0.086337f, -0.138710f },	{ -0.301439f, 0.086337f, -0.201358f },
-	{ -0.459376f, 0.086335f, -0.190260f },	{ -0.413442f, 0.086335f, -0.276196f },	{ -0.256370f, -0.084705f, -0.256276f },
-	{ -0.301434f, 0.086337f, -0.201365f },	{ -0.301434f, -0.084705f, -0.201365f }, { -0.256370f, 0.086337f, -0.256276f },
-	{ -0.413438f, 0.086335f, -0.276203f },	{ -0.351621f, 0.086335f, -0.351527f },	{ -0.413438f, -0.084704f, -0.276203f },
-	{ -0.351621f, -0.084704f, -0.351527f }, { -0.256364f, -0.084705f, -0.256283f }, { -0.201453f, 0.086337f, -0.301347f },
-	{ -0.256364f, 0.086337f, -0.256283f },	{ -0.201453f, -0.084705f, -0.301347f }, { -0.276292f, -0.084704f, -0.413350f },
-	{ -0.351615f, -0.084704f, -0.351534f }, { -0.351615f, 0.086335f, -0.351534f },	{ -0.276292f, 0.086335f, -0.413350f },
-	{ -0.201447f, -0.084705f, -0.301352f }, { -0.276285f, -0.084704f, -0.413355f }, { -0.138799f, -0.084705f, -0.334838f },
-	{ -0.190349f, -0.084704f, -0.459289f }, { -0.276285f, 0.086335f, -0.413355f },	{ -0.201447f, 0.086337f, -0.301352f },
-	{ -0.190349f, 0.086335f, -0.459289f },	{ -0.138799f, 0.086337f, -0.334838f },	{ -0.190341f, 0.086335f, -0.459293f },
-	{ -0.190341f, -0.084704f, -0.459293f }, { -0.138791f, -0.084705f, -0.334842f }, { -0.138791f, 0.086337f, -0.334842f },
-	{ -0.070815f, 0.086337f, -0.355462f },	{ -0.070815f, -0.084705f, -0.355462f }, { -0.097095f, 0.086335f, -0.487579f },
-	{ -0.097095f, -0.084704f, -0.487579f }, { -0.070807f, 0.086337f, -0.355464f },	{ -0.097086f, 0.086335f, -0.487581f },
-	{ -0.097086f, -0.084704f, -0.487581f }, { -0.070807f, -0.084705f, -0.355464f }, { -0.000113f, -0.084705f, -0.362427f },
-	{ -0.000113f, 0.086337f, -0.362427f },	{ -0.000113f, 0.086335f, -0.497132f },	{ -0.000113f, -0.084704f, -0.497132f },
-	{ 0.070588f, 0.086337f, -0.355465f },	{ 0.096868f, -0.084704f, -0.487582f },	{ 0.096868f, 0.086335f, -0.487582f },
-	{ 0.070588f, -0.084705f, -0.355465f },	{ -0.000105f, 0.086337f, -0.362427f },	{ -0.000105f, 0.086335f, -0.497133f },
-	{ -0.000105f, -0.084704f, -0.497133f }, { -0.000105f, -0.084705f, -0.362427f }, { 0.190123f, -0.084704f, -0.459294f },
-	{ 0.190123f, 0.086335f, -0.459294f },	{ 0.138573f, -0.084705f, -0.334843f },	{ 0.138573f, 0.086337f, -0.334843f },
-	{ 0.070597f, 0.086337f, -0.355463f },	{ 0.070597f, -0.084705f, -0.355463f },	{ 0.096876f, -0.084704f, -0.487580f },
-	{ 0.096876f, 0.086335f, -0.487580f },	{ 0.201229f, -0.084705f, -0.301354f },	{ 0.276067f, -0.084704f, -0.413358f },
-	{ 0.201229f, 0.086337f, -0.301354f },	{ 0.138581f, -0.084705f, -0.334840f },	{ 0.138581f, 0.086337f, -0.334840f },
-	{ 0.190131f, 0.086335f, -0.459292f },	{ 0.276067f, 0.086335f, -0.413358f },	{ 0.190131f, -0.084704f, -0.459292f },
-	{ 0.201236f, 0.086337f, -0.301350f },	{ 0.256147f, -0.084705f, -0.256286f },	{ 0.256147f, 0.086337f, -0.256286f },
-	{ 0.201236f, -0.084705f, -0.301350f },	{ 0.351398f, -0.084704f, -0.351537f },	{ 0.351398f, 0.086335f, -0.351537f },
-	{ 0.276074f, -0.084704f, -0.413353f },	{ 0.276074f, 0.086335f, -0.413353f },	{ 0.301218f, -0.084705f, -0.201369f },
-	{ 0.301218f, 0.086337f, -0.201369f },	{ 0.256154f, -0.084705f, -0.256280f },	{ 0.256154f, 0.086337f, -0.256280f },
-	{ 0.413221f, 0.086335f, -0.276207f },	{ 0.413221f, -0.084704f, -0.276207f },	{ 0.351405f, 0.086335f, -0.351531f },
-	{ 0.351405f, -0.084704f, -0.351531f },	{ 0.334709f, 0.086337f, -0.138715f },	{ 0.301223f, 0.086337f, -0.201362f },
-	{ 0.334709f, -0.084705f, -0.138715f },	{ 0.301223f, -0.084705f, -0.201362f },	{ 0.459160f, -0.084704f, -0.190264f },
-	{ 0.459160f, 0.086335f, -0.190264f },	{ 0.413226f, 0.086335f, -0.276200f },	{ 0.413226f, -0.084704f, -0.276200f },
-	{ 0.334713f, -0.084705f, -0.138707f },	{ 0.355333f, -0.084705f, -0.070731f },	{ 0.334713f, 0.086337f, -0.138707f },
-	{ 0.355333f, 0.086337f, -0.070731f },	{ 0.459164f, 0.086335f, -0.190257f },	{ 0.487450f, 0.086335f, -0.097010f },
-	{ 0.487450f, -0.084704f, -0.097010f },	{ 0.459164f, -0.084704f, -0.190257f },	{ 0.355335f, -0.084705f, -0.070722f },
-	{ 0.362298f, -0.084705f, -0.000029f },	{ 0.355335f, 0.086337f, -0.070722f },	{ 0.362298f, 0.086337f, -0.000029f },
-	{ 0.497003f, -0.084704f, -0.000029f },	{ 0.497003f, 0.086335f, -0.000029f },	{ 0.487452f, 0.086335f, -0.097002f },
-	{ 0.487452f, -0.084704f, -0.097002f },	{ 0.362298f, -0.084705f, -0.000021f },	{ 0.497003f, -0.084704f, -0.000021f },
-	{ 0.355336f, -0.084705f, 0.070673f },	{ 0.487453f, -0.084704f, 0.096952f },	{ 0.497003f, 0.086335f, -0.000021f },
-	{ 0.362298f, 0.086337f, -0.000021f },	{ 0.355336f, 0.086337f, 0.070673f },	{ 0.487453f, 0.086335f, 0.096952f },
-	{ 0.355334f, -0.084705f, 0.070681f },	{ 0.355334f, 0.086337f, 0.070681f },	{ 0.487451f, 0.086335f, 0.096961f },
-	{ 0.487451f, -0.084704f, 0.096961f },	{ 0.334714f, -0.084705f, 0.138658f },	{ 0.459165f, -0.084704f, 0.190207f },
-	{ 0.334714f, 0.086337f, 0.138658f },	{ 0.459165f, 0.086335f, 0.190207f },	{ 0.334711f, 0.086337f, 0.138666f },
-	{ 0.301225f, 0.086337f, 0.201313f },	{ 0.459163f, 0.086335f, 0.190215f },	{ 0.413229f, 0.086335f, 0.276151f },
-	{ 0.334711f, -0.084705f, 0.138666f },	{ 0.301225f, -0.084705f, 0.201313f },	{ 0.413229f, -0.084704f, 0.276151f },
-	{ 0.459163f, -0.084704f, 0.190215f },	{ 0.301221f, -0.084705f, 0.201321f },	{ 0.256157f, -0.084705f, 0.256232f },
-	{ 0.301221f, 0.086337f, 0.201321f },	{ 0.256157f, 0.086337f, 0.256232f },	{ 0.413224f, -0.084704f, 0.276159f },
-	{ 0.413224f, 0.086335f, 0.276159f },	{ 0.351408f, 0.086335f, 0.351483f },	{ 0.351408f, -0.084704f, 0.351483f },
-	{ 0.201240f, -0.084705f, 0.301302f },	{ 0.201240f, 0.086337f, 0.301302f },	{ 0.256151f, -0.084705f, 0.256238f },
-	{ 0.256151f, 0.086337f, 0.256238f },	{ 0.351402f, 0.086335f, 0.351489f },	{ 0.351402f, -0.084704f, 0.351489f },
-	{ 0.276078f, 0.086335f, 0.413305f },	{ 0.276078f, -0.084704f, 0.413305f },	{ 0.138586f, -0.084705f, 0.334793f },
-	{ 0.201233f, -0.084705f, 0.301307f },	{ 0.190135f, -0.084704f, 0.459244f },	{ 0.276071f, -0.084704f, 0.413311f },
-	{ 0.201233f, 0.086337f, 0.301307f },	{ 0.138586f, 0.086337f, 0.334793f },	{ 0.276071f, 0.086335f, 0.413311f },
-	{ 0.190135f, 0.086335f, 0.459244f },	{ 0.138578f, -0.084705f, 0.334797f },	{ 0.070602f, -0.084705f, 0.355417f },
-	{ 0.138578f, 0.086337f, 0.334797f },	{ 0.070602f, 0.086337f, 0.355417f },	{ 0.190127f, 0.086335f, 0.459248f },
-	{ 0.190127f, -0.084704f, 0.459248f },	{ 0.096881f, 0.086335f, 0.487534f },	{ 0.096881f, -0.084704f, 0.487534f },
-	{ 0.070593f, -0.084705f, 0.355419f },	{ 0.096873f, 0.086335f, 0.487536f },	{ 0.096873f, -0.084704f, 0.487536f },
-	{ 0.070593f, 0.086337f, 0.355419f },	{ -0.000100f, 0.086337f, 0.362382f },	{ -0.000100f, 0.086335f, 0.497087f },
-	{ -0.000100f, -0.084704f, 0.497087f },	{ -0.000100f, -0.084705f, 0.362382f },
+	{ 0.010279f, 0.086341f, 0.051768f },	{ -0.010314f, -0.084708f, 0.051804f },
+	{ 0.010279f, -0.084708f, 0.051768f },	{ -0.010314f, 0.086341f, 0.051804f },
+	{ 0.029138f, -0.084708f, -0.043911f },	{ 0.043724f, -0.084708f, -0.029376f },
+	{ 0.010098f, -0.084708f, -0.051759f },	{ -0.010494f, -0.084708f, -0.051723f },
+	{ 0.051638f, -0.084708f, -0.010364f },	{ 0.051674f, -0.084708f, 0.010229f },
+	{ 0.043827f, -0.084708f, 0.029268f },	{ 0.029291f, -0.084708f, 0.043855f },
+	{ -0.029353f, -0.084708f, 0.043957f },	{ -0.051889f, -0.084708f, -0.010183f },
+	{ -0.051853f, -0.084708f, 0.010409f },	{ -0.043939f, -0.084708f, 0.029421f },
+	{ -0.029506f, -0.084708f, -0.043809f }, { -0.044042f, -0.084708f, -0.029222f },
+	{ -0.029353f, 0.086341f, 0.043957f },	{ 0.043724f, 0.086341f, -0.029376f },
+	{ 0.029138f, 0.086341f, -0.043911f },	{ 0.010098f, 0.086341f, -0.051759f },
+	{ 0.051638f, 0.086341f, -0.010364f },	{ 0.051674f, 0.086341f, 0.010229f },
+	{ -0.044042f, 0.086341f, -0.029222f },	{ 0.043827f, 0.086341f, 0.029268f },
+	{ -0.051889f, 0.086341f, -0.010183f },	{ -0.043939f, 0.086341f, 0.029421f },
+	{ -0.029506f, 0.086341f, -0.043809f },	{ 0.035354f, 0.070897f, 0.035658f },
+	{ 0.035354f, -0.069397f, 0.035658f },	{ -0.035498f, 0.070897f, 0.035658f },
+	{ -0.035498f, -0.069397f, 0.035658f },	{ 0.035354f, -0.069397f, 0.365503f },
+	{ 0.035354f, 0.070897f, 0.365503f },	{ -0.035498f, 0.070897f, 0.365503f },
+	{ -0.035498f, -0.069397f, 0.365503f },	{ 0.035354f, 0.070897f, -0.365033f },
+	{ 0.035354f, -0.069397f, -0.365033f },	{ -0.035498f, 0.070897f, -0.365033f },
+	{ -0.035498f, -0.069397f, -0.365033f }, { 0.035354f, -0.069397f, -0.035187f },
+	{ 0.035354f, 0.070897f, -0.035187f },	{ -0.035498f, 0.070897f, -0.035187f },
+	{ -0.035498f, -0.069397f, -0.035187f }, { -0.035494f, -0.069397f, -0.035191f },
+	{ -0.365340f, -0.069397f, -0.035191f }, { -0.035494f, 0.070897f, -0.035191f },
+	{ -0.365340f, 0.070897f, -0.035191f },	{ -0.365340f, -0.069397f, 0.035661f },
+	{ -0.035494f, -0.069397f, 0.035661f },	{ -0.035494f, 0.070897f, 0.035661f },
+	{ -0.365340f, 0.070897f, 0.035661f },	{ 0.035350f, 0.070897f, -0.035191f },
+	{ 0.365196f, 0.070897f, -0.035191f },	{ 0.035350f, -0.069397f, -0.035191f },
+	{ 0.365196f, -0.069397f, -0.035191f },	{ 0.365196f, 0.070897f, 0.035661f },
+	{ 0.035350f, 0.070897f, 0.035661f },	{ 0.035350f, -0.069397f, 0.035661f },
+	{ 0.365196f, -0.069397f, 0.035661f },	{ -0.070802f, 0.086337f, 0.355420f },
+	{ -0.070802f, -0.084705f, 0.355420f },	{ -0.097081f, 0.086335f, 0.487537f },
+	{ -0.097081f, -0.084704f, 0.487537f },	{ -0.000108f, 0.086337f, 0.362383f },
+	{ -0.000108f, 0.086335f, 0.497088f },	{ -0.000108f, -0.084704f, 0.497088f },
+	{ -0.000108f, -0.084705f, 0.362383f },	{ -0.138787f, -0.084705f, 0.334799f },
+	{ -0.138787f, 0.086337f, 0.334799f },	{ -0.070810f, -0.084705f, 0.355419f },
+	{ -0.070810f, 0.086337f, 0.355419f },	{ -0.097090f, 0.086335f, 0.487536f },
+	{ -0.190336f, 0.086335f, 0.459250f },	{ -0.190336f, -0.084704f, 0.459250f },
+	{ -0.097090f, -0.084704f, 0.487536f },	{ -0.138795f, 0.086337f, 0.334796f },
+	{ -0.138795f, -0.084705f, 0.334796f },	{ -0.201442f, 0.086337f, 0.301310f },
+	{ -0.201442f, -0.084705f, 0.301310f },	{ -0.276280f, -0.084704f, 0.413313f },
+	{ -0.276280f, 0.086335f, 0.413313f },	{ -0.190344f, 0.086335f, 0.459247f },
+	{ -0.190344f, -0.084704f, 0.459247f },	{ -0.201450f, -0.084705f, 0.301306f },
+	{ -0.256361f, -0.084705f, 0.256241f },	{ -0.201450f, 0.086337f, 0.301306f },
+	{ -0.256361f, 0.086337f, 0.256241f },	{ -0.351612f, 0.086335f, 0.351492f },
+	{ -0.351612f, -0.084704f, 0.351492f },	{ -0.276288f, 0.086335f, 0.413309f },
+	{ -0.276288f, -0.084704f, 0.413309f },	{ -0.301431f, -0.084705f, 0.201325f },
+	{ -0.413435f, -0.084704f, 0.276163f },	{ -0.413435f, 0.086335f, 0.276163f },
+	{ -0.301431f, 0.086337f, 0.201325f },	{ -0.256367f, -0.084705f, 0.256236f },
+	{ -0.256367f, 0.086337f, 0.256236f },	{ -0.351618f, 0.086335f, 0.351487f },
+	{ -0.351618f, -0.084704f, 0.351487f },	{ -0.334922f, -0.084705f, 0.138670f },
+	{ -0.459374f, -0.084704f, 0.190220f },	{ -0.459374f, 0.086335f, 0.190220f },
+	{ -0.334922f, 0.086337f, 0.138670f },	{ -0.301436f, 0.086337f, 0.201318f },
+	{ -0.301436f, -0.084705f, 0.201318f },	{ -0.413440f, 0.086335f, 0.276156f },
+	{ -0.413440f, -0.084704f, 0.276156f },	{ -0.487663f, -0.084704f, 0.096966f },
+	{ -0.355546f, -0.084705f, 0.070686f },	{ -0.459377f, -0.084704f, 0.190212f },
+	{ -0.334926f, -0.084705f, 0.138663f },	{ -0.355546f, 0.086337f, 0.070686f },
+	{ -0.334926f, 0.086337f, 0.138663f },	{ -0.487663f, 0.086335f, 0.096966f },
+	{ -0.459377f, 0.086335f, 0.190212f },	{ -0.362511f, -0.084705f, -0.000016f },
+	{ -0.355549f, -0.084705f, 0.070678f },	{ -0.497217f, -0.084704f, -0.000016f },
+	{ -0.487665f, -0.084704f, 0.096957f },	{ -0.497217f, 0.086335f, -0.000016f },
+	{ -0.362511f, 0.086337f, -0.000016f },	{ -0.355549f, 0.086337f, 0.070678f },
+	{ -0.487665f, 0.086335f, 0.096957f },	{ -0.362512f, 0.086337f, -0.000024f },
+	{ -0.362512f, -0.084705f, -0.000024f }, { -0.355549f, 0.086337f, -0.070717f },
+	{ -0.355549f, -0.084705f, -0.070717f }, { -0.497217f, -0.084704f, -0.000024f },
+	{ -0.487666f, -0.084704f, -0.096997f }, { -0.497217f, 0.086335f, -0.000024f },
+	{ -0.487666f, 0.086335f, -0.096997f },	{ -0.334927f, -0.084705f, -0.138702f },
+	{ -0.355548f, 0.086337f, -0.070726f },	{ -0.355548f, -0.084705f, -0.070726f },
+	{ -0.334927f, 0.086337f, -0.138702f },	{ -0.487665f, -0.084704f, -0.097005f },
+	{ -0.459379f, -0.084704f, -0.190252f }, { -0.487665f, 0.086335f, -0.097005f },
+	{ -0.459379f, 0.086335f, -0.190252f },	{ -0.413442f, -0.084704f, -0.276196f },
+	{ -0.301439f, -0.084705f, -0.201358f }, { -0.334925f, -0.084705f, -0.138710f },
+	{ -0.459376f, -0.084704f, -0.190260f }, { -0.334925f, 0.086337f, -0.138710f },
+	{ -0.301439f, 0.086337f, -0.201358f },	{ -0.459376f, 0.086335f, -0.190260f },
+	{ -0.413442f, 0.086335f, -0.276196f },	{ -0.256370f, -0.084705f, -0.256276f },
+	{ -0.301434f, 0.086337f, -0.201365f },	{ -0.301434f, -0.084705f, -0.201365f },
+	{ -0.256370f, 0.086337f, -0.256276f },	{ -0.413438f, 0.086335f, -0.276203f },
+	{ -0.351621f, 0.086335f, -0.351527f },	{ -0.413438f, -0.084704f, -0.276203f },
+	{ -0.351621f, -0.084704f, -0.351527f }, { -0.256364f, -0.084705f, -0.256283f },
+	{ -0.201453f, 0.086337f, -0.301347f },	{ -0.256364f, 0.086337f, -0.256283f },
+	{ -0.201453f, -0.084705f, -0.301347f }, { -0.276292f, -0.084704f, -0.413350f },
+	{ -0.351615f, -0.084704f, -0.351534f }, { -0.351615f, 0.086335f, -0.351534f },
+	{ -0.276292f, 0.086335f, -0.413350f },	{ -0.201447f, -0.084705f, -0.301352f },
+	{ -0.276285f, -0.084704f, -0.413355f }, { -0.138799f, -0.084705f, -0.334838f },
+	{ -0.190349f, -0.084704f, -0.459289f }, { -0.276285f, 0.086335f, -0.413355f },
+	{ -0.201447f, 0.086337f, -0.301352f },	{ -0.190349f, 0.086335f, -0.459289f },
+	{ -0.138799f, 0.086337f, -0.334838f },	{ -0.190341f, 0.086335f, -0.459293f },
+	{ -0.190341f, -0.084704f, -0.459293f }, { -0.138791f, -0.084705f, -0.334842f },
+	{ -0.138791f, 0.086337f, -0.334842f },	{ -0.070815f, 0.086337f, -0.355462f },
+	{ -0.070815f, -0.084705f, -0.355462f }, { -0.097095f, 0.086335f, -0.487579f },
+	{ -0.097095f, -0.084704f, -0.487579f }, { -0.070807f, 0.086337f, -0.355464f },
+	{ -0.097086f, 0.086335f, -0.487581f },	{ -0.097086f, -0.084704f, -0.487581f },
+	{ -0.070807f, -0.084705f, -0.355464f }, { -0.000113f, -0.084705f, -0.362427f },
+	{ -0.000113f, 0.086337f, -0.362427f },	{ -0.000113f, 0.086335f, -0.497132f },
+	{ -0.000113f, -0.084704f, -0.497132f }, { 0.070588f, 0.086337f, -0.355465f },
+	{ 0.096868f, -0.084704f, -0.487582f },	{ 0.096868f, 0.086335f, -0.487582f },
+	{ 0.070588f, -0.084705f, -0.355465f },	{ -0.000105f, 0.086337f, -0.362427f },
+	{ -0.000105f, 0.086335f, -0.497133f },	{ -0.000105f, -0.084704f, -0.497133f },
+	{ -0.000105f, -0.084705f, -0.362427f }, { 0.190123f, -0.084704f, -0.459294f },
+	{ 0.190123f, 0.086335f, -0.459294f },	{ 0.138573f, -0.084705f, -0.334843f },
+	{ 0.138573f, 0.086337f, -0.334843f },	{ 0.070597f, 0.086337f, -0.355463f },
+	{ 0.070597f, -0.084705f, -0.355463f },	{ 0.096876f, -0.084704f, -0.487580f },
+	{ 0.096876f, 0.086335f, -0.487580f },	{ 0.201229f, -0.084705f, -0.301354f },
+	{ 0.276067f, -0.084704f, -0.413358f },	{ 0.201229f, 0.086337f, -0.301354f },
+	{ 0.138581f, -0.084705f, -0.334840f },	{ 0.138581f, 0.086337f, -0.334840f },
+	{ 0.190131f, 0.086335f, -0.459292f },	{ 0.276067f, 0.086335f, -0.413358f },
+	{ 0.190131f, -0.084704f, -0.459292f },	{ 0.201236f, 0.086337f, -0.301350f },
+	{ 0.256147f, -0.084705f, -0.256286f },	{ 0.256147f, 0.086337f, -0.256286f },
+	{ 0.201236f, -0.084705f, -0.301350f },	{ 0.351398f, -0.084704f, -0.351537f },
+	{ 0.351398f, 0.086335f, -0.351537f },	{ 0.276074f, -0.084704f, -0.413353f },
+	{ 0.276074f, 0.086335f, -0.413353f },	{ 0.301218f, -0.084705f, -0.201369f },
+	{ 0.301218f, 0.086337f, -0.201369f },	{ 0.256154f, -0.084705f, -0.256280f },
+	{ 0.256154f, 0.086337f, -0.256280f },	{ 0.413221f, 0.086335f, -0.276207f },
+	{ 0.413221f, -0.084704f, -0.276207f },	{ 0.351405f, 0.086335f, -0.351531f },
+	{ 0.351405f, -0.084704f, -0.351531f },	{ 0.334709f, 0.086337f, -0.138715f },
+	{ 0.301223f, 0.086337f, -0.201362f },	{ 0.334709f, -0.084705f, -0.138715f },
+	{ 0.301223f, -0.084705f, -0.201362f },	{ 0.459160f, -0.084704f, -0.190264f },
+	{ 0.459160f, 0.086335f, -0.190264f },	{ 0.413226f, 0.086335f, -0.276200f },
+	{ 0.413226f, -0.084704f, -0.276200f },	{ 0.334713f, -0.084705f, -0.138707f },
+	{ 0.355333f, -0.084705f, -0.070731f },	{ 0.334713f, 0.086337f, -0.138707f },
+	{ 0.355333f, 0.086337f, -0.070731f },	{ 0.459164f, 0.086335f, -0.190257f },
+	{ 0.487450f, 0.086335f, -0.097010f },	{ 0.487450f, -0.084704f, -0.097010f },
+	{ 0.459164f, -0.084704f, -0.190257f },	{ 0.355335f, -0.084705f, -0.070722f },
+	{ 0.362298f, -0.084705f, -0.000029f },	{ 0.355335f, 0.086337f, -0.070722f },
+	{ 0.362298f, 0.086337f, -0.000029f },	{ 0.497003f, -0.084704f, -0.000029f },
+	{ 0.497003f, 0.086335f, -0.000029f },	{ 0.487452f, 0.086335f, -0.097002f },
+	{ 0.487452f, -0.084704f, -0.097002f },	{ 0.362298f, -0.084705f, -0.000021f },
+	{ 0.497003f, -0.084704f, -0.000021f },	{ 0.355336f, -0.084705f, 0.070673f },
+	{ 0.487453f, -0.084704f, 0.096952f },	{ 0.497003f, 0.086335f, -0.000021f },
+	{ 0.362298f, 0.086337f, -0.000021f },	{ 0.355336f, 0.086337f, 0.070673f },
+	{ 0.487453f, 0.086335f, 0.096952f },	{ 0.355334f, -0.084705f, 0.070681f },
+	{ 0.355334f, 0.086337f, 0.070681f },	{ 0.487451f, 0.086335f, 0.096961f },
+	{ 0.487451f, -0.084704f, 0.096961f },	{ 0.334714f, -0.084705f, 0.138658f },
+	{ 0.459165f, -0.084704f, 0.190207f },	{ 0.334714f, 0.086337f, 0.138658f },
+	{ 0.459165f, 0.086335f, 0.190207f },	{ 0.334711f, 0.086337f, 0.138666f },
+	{ 0.301225f, 0.086337f, 0.201313f },	{ 0.459163f, 0.086335f, 0.190215f },
+	{ 0.413229f, 0.086335f, 0.276151f },	{ 0.334711f, -0.084705f, 0.138666f },
+	{ 0.301225f, -0.084705f, 0.201313f },	{ 0.413229f, -0.084704f, 0.276151f },
+	{ 0.459163f, -0.084704f, 0.190215f },	{ 0.301221f, -0.084705f, 0.201321f },
+	{ 0.256157f, -0.084705f, 0.256232f },	{ 0.301221f, 0.086337f, 0.201321f },
+	{ 0.256157f, 0.086337f, 0.256232f },	{ 0.413224f, -0.084704f, 0.276159f },
+	{ 0.413224f, 0.086335f, 0.276159f },	{ 0.351408f, 0.086335f, 0.351483f },
+	{ 0.351408f, -0.084704f, 0.351483f },	{ 0.201240f, -0.084705f, 0.301302f },
+	{ 0.201240f, 0.086337f, 0.301302f },	{ 0.256151f, -0.084705f, 0.256238f },
+	{ 0.256151f, 0.086337f, 0.256238f },	{ 0.351402f, 0.086335f, 0.351489f },
+	{ 0.351402f, -0.084704f, 0.351489f },	{ 0.276078f, 0.086335f, 0.413305f },
+	{ 0.276078f, -0.084704f, 0.413305f },	{ 0.138586f, -0.084705f, 0.334793f },
+	{ 0.201233f, -0.084705f, 0.301307f },	{ 0.190135f, -0.084704f, 0.459244f },
+	{ 0.276071f, -0.084704f, 0.413311f },	{ 0.201233f, 0.086337f, 0.301307f },
+	{ 0.138586f, 0.086337f, 0.334793f },	{ 0.276071f, 0.086335f, 0.413311f },
+	{ 0.190135f, 0.086335f, 0.459244f },	{ 0.138578f, -0.084705f, 0.334797f },
+	{ 0.070602f, -0.084705f, 0.355417f },	{ 0.138578f, 0.086337f, 0.334797f },
+	{ 0.070602f, 0.086337f, 0.355417f },	{ 0.190127f, 0.086335f, 0.459248f },
+	{ 0.190127f, -0.084704f, 0.459248f },	{ 0.096881f, 0.086335f, 0.487534f },
+	{ 0.096881f, -0.084704f, 0.487534f },	{ 0.070593f, -0.084705f, 0.355419f },
+	{ 0.096873f, 0.086335f, 0.487536f },	{ 0.096873f, -0.084704f, 0.487536f },
+	{ 0.070593f, 0.086337f, 0.355419f },	{ -0.000100f, 0.086337f, 0.362382f },
+	{ -0.000100f, 0.086335f, 0.497087f },	{ -0.000100f, -0.084704f, 0.497087f },
+	{ -0.000100f, -0.084705f, 0.362382f },
 };
 
 typedef struct WheelHullSpan
@@ -1040,10 +1471,11 @@ typedef struct WheelHullSpan
 	int count;
 } WheelHullSpan;
 static const WheelHullSpan s_metalWheel1Hulls[37] = {
-	{ 0, 29 },	{ 29, 8 },	{ 37, 8 },	{ 45, 8 },	{ 53, 8 },	{ 61, 8 },	{ 69, 8 },	{ 77, 8 },	{ 85, 8 },	{ 93, 8 },
-	{ 101, 8 }, { 109, 8 }, { 117, 8 }, { 125, 8 }, { 133, 8 }, { 141, 8 }, { 149, 8 }, { 157, 8 }, { 165, 8 }, { 173, 8 },
-	{ 181, 8 }, { 189, 8 }, { 197, 8 }, { 205, 8 }, { 213, 8 }, { 221, 8 }, { 229, 8 }, { 237, 8 }, { 245, 8 }, { 253, 8 },
-	{ 261, 8 }, { 269, 8 }, { 277, 8 }, { 285, 8 }, { 293, 8 }, { 301, 8 }, { 309, 8 },
+	{ 0, 29 },	{ 29, 8 },	{ 37, 8 },	{ 45, 8 },	{ 53, 8 },	{ 61, 8 },	{ 69, 8 },	{ 77, 8 },
+	{ 85, 8 },	{ 93, 8 },	{ 101, 8 }, { 109, 8 }, { 117, 8 }, { 125, 8 }, { 133, 8 }, { 141, 8 },
+	{ 149, 8 }, { 157, 8 }, { 165, 8 }, { 173, 8 }, { 181, 8 }, { 189, 8 }, { 197, 8 }, { 205, 8 },
+	{ 213, 8 }, { 221, 8 }, { 229, 8 }, { 237, 8 }, { 245, 8 }, { 253, 8 }, { 261, 8 }, { 269, 8 },
+	{ 277, 8 }, { 285, 8 }, { 293, 8 }, { 301, 8 }, { 309, 8 },
 };
 #define s_metalWheel1HullCount 37
 
@@ -1096,11 +1528,11 @@ public:
 			bodyDef.position = { 0.0f, startY + i * spacing, 0.0f };
 			b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
 
-			//for ( int h = 0; h < s_metalWheel1HullCount; ++h )
+			// for ( int h = 0; h < s_metalWheel1HullCount; ++h )
 			//{
 			//	b3CreateHullShape( bodyId, &shapeDef, m_hulls[h] );
-			//}
-			
+			// }
+
 			// Using a single hull improves the simulation.
 			b3CreateHullShape( bodyId, &shapeDef, wheelHull );
 		}
@@ -1125,14 +1557,14 @@ public:
 		b3Profile p = b3World_GetProfile( m_worldId );
 		float substepRate = m_context->hertz * m_context->subStepCount;
 
-		DrawTextLine( "wheels %d, hull pieces/wheel %d (%d total shapes)", m_wheelCount, s_metalWheel1HullCount,
-					  m_wheelCount * s_metalWheel1HullCount );
-		DrawTextLine( "step %.0f hz, sub-steps %d -> substep rate %.0f hz", m_context->hertz, m_context->subStepCount,
-					  substepRate );
+		DrawTextLine( "wheels %d, hull pieces/wheel %d (%d total shapes)", m_wheelCount,
+					  s_metalWheel1HullCount, m_wheelCount * s_metalWheel1HullCount );
+		DrawTextLine( "step %.0f hz, sub-steps %d -> substep rate %.0f hz", m_context->hertz,
+					  m_context->subStepCount, substepRate );
 		DrawTextLine( "eff contact hz = min(240, %.0f) = %.0f", 0.125f * substepRate,
 					  b3MinFloat( 240.0f, 0.125f * substepRate ) );
-		DrawTextLine( "step %.3f ms | collide %.3f ms (%.0f%%) | solve %.3f ms (%.0f%%)", p.step, p.collide,
-					  p.step > 0.0f ? 100.0f * p.collide / p.step : 0.0f, p.solve,
+		DrawTextLine( "step %.3f ms | collide %.3f ms (%.0f%%) | solve %.3f ms (%.0f%%)", p.step,
+					  p.collide, p.step > 0.0f ? 100.0f * p.collide / p.step : 0.0f, p.solve,
 					  p.step > 0.0f ? 100.0f * p.solve / p.step : 0.0f );
 	}
 
@@ -1146,3 +1578,1006 @@ public:
 };
 
 static int sampleWheelStack = RegisterSample( "Issues", "GMod Wheel Stack", WheelStack::Create );
+
+// There was a problem where this bouncing box could gain energy. This has been fixed by the
+// deferred restitution update.
+class RestitutionOvershoot : public Sample
+{
+public:
+	static constexpr float m_boxHalf = 0.5f;
+	static constexpr float m_floorHalfXZ = 0.375f;
+	static constexpr float m_floorHalfY = 0.25f;
+	static constexpr float m_dropHeight = 10.0f;
+	static constexpr float m_tolerance = 0.05f;
+
+	explicit RestitutionOvershoot( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 20.0f, 0.0f, 28.0f, { 0.0f, m_dropHeight + m_boxHalf, 0.0f } );
+		}
+
+		b3BoxHull floor = b3MakeBoxHull( m_floorHalfXZ, m_floorHalfY, m_floorHalfXZ );
+		b3BodyDef floorDef = b3DefaultBodyDef();
+		floorDef.type = b3_staticBody;
+		floorDef.position = { 0.0f, -m_floorHalfY, 0.0f };
+		b3BodyId floorBody = b3CreateBody( m_worldId, &floorDef );
+
+		b3ShapeDef floorShape = b3DefaultShapeDef();
+		b3CreateHullShape( floorBody, &floorShape, &floor.base );
+
+		b3BoxHull box = b3MakeBoxHull( m_boxHalf, m_boxHalf, m_boxHalf );
+		b3BodyDef boxDef = b3DefaultBodyDef();
+		boxDef.type = b3_dynamicBody;
+		boxDef.position = { 0.0f, m_dropHeight, 0.0f };
+		boxDef.safetyFactor = 0.1f;
+		m_boxBody = b3CreateBody( m_worldId, &boxDef );
+
+		b3ShapeDef boxShape = b3DefaultShapeDef();
+		boxShape.baseMaterial.restitution = 1.0f;
+		b3CreateHullShape( m_boxBody, &boxShape, &box.base );
+
+		m_currentY = m_dropHeight;
+		m_maxBounceY = 0.0f;
+		m_bounced = false;
+		m_failed = false;
+		m_startEnergy = MeasureEnergy( m_worldId, &m_boxBody, 1 ).Total();
+		m_maxEnergy = m_startEnergy;
+		m_energyFailed = false;
+	}
+
+	void Step() override
+	{
+		Sample::Step();
+
+		if ( B3_IS_NON_NULL( m_boxBody ) == false )
+		{
+			return;
+		}
+
+		b3Pos position = b3Body_GetPosition( m_boxBody );
+		m_currentY = position.y;
+
+		b3Vec3 velocity = b3Body_GetLinearVelocity( m_boxBody );
+		if ( m_bounced == false && velocity.y > 0.0f )
+		{
+			m_bounced = true;
+		}
+
+		if ( m_bounced )
+		{
+			if ( position.y > m_maxBounceY )
+			{
+				m_maxBounceY = position.y;
+			}
+			if ( position.y > m_dropHeight + m_tolerance )
+			{
+				m_failed = true;
+			}
+		}
+
+		b3Pos markerPoint = { 0.0f, m_dropHeight + m_boxHalf, 0.0f };
+		DrawPlane( b3Vec3_axisY, markerPoint, MakeColor( b3_colorYellow ) );
+
+		// Perfect restitution and no friction, so the total energy may only decrease. It is the
+		// honest invariant here: the height check cannot tell a bounce that gained potential energy
+		// from one that converted it into spin, and this drop does both.
+		MechanicalEnergy energy = MeasureEnergy( m_worldId, &m_boxBody, 1 );
+		float total = energy.Total();
+
+		if ( total > m_maxEnergy )
+		{
+			m_maxEnergy = total;
+		}
+
+		if ( m_bounced && total > m_startEnergy * ( 1.0f + m_energyTolerance ) )
+		{
+			m_energyFailed = true;
+		}
+
+		DrawTextLine( "drop height = %.2f m", m_dropHeight );
+		DrawTextLine( "current y   = %.2f m", m_currentY );
+		DrawTextLine( "max bounce  = %.2f m", m_maxBounceY );
+		DrawTextLine( "kinetic     = %.0f J linear + %.0f J angular", energy.linear,
+					  energy.angular );
+		DrawTextLine( "potential   = %.0f J", energy.potential );
+		DrawTextLine( "total       = %.0f J (%.2f%% of start, peak %.2f%%)", total,
+					  100.0f * total / m_startEnergy, 100.0f * m_maxEnergy / m_startEnergy );
+
+		if ( m_bounced == false )
+		{
+			DrawTextLine( "waiting for first bounce..." );
+		}
+		else if ( m_failed )
+		{
+			DrawTextLine( "FAIL: box exceeded drop height" );
+		}
+		else
+		{
+			DrawTextLine( "PASS: bounce stays at or below drop height" );
+		}
+
+		if ( m_energyFailed )
+		{
+			DrawTextLine( "FAIL: total energy increased" );
+		}
+		else if ( m_bounced )
+		{
+			DrawTextLine( "PASS: total energy did not increase" );
+		}
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new RestitutionOvershoot( context );
+	}
+
+	static constexpr float m_energyTolerance = 0.001f;
+
+	b3BodyId m_boxBody = {};
+	float m_currentY = 0.0f;
+	float m_maxBounceY = 0.0f;
+	float m_startEnergy = 0.0f;
+	float m_maxEnergy = 0.0f;
+	bool m_bounced = false;
+	bool m_failed = false;
+	bool m_energyFailed = false;
+};
+
+static int sampleRestitutionOvershoot =
+	RegisterSample( "Issues", "Restitution Overshoot", RestitutionOvershoot::Create );
+
+class SlideTwistOffCenterShape : public Sample
+{
+public:
+	explicit SlideTwistOffCenterShape( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( -30.0f, 17.0f, 30.0f, { 0.0f, 5.0f, 0.0f } );
+		}
+
+		AddGroundBox( 50.0f );
+
+		b3Quat orientation = b3MakeQuatFromAxisAngle( b3Vec3_axisX, 20.0f * B3_DEG_TO_RAD );
+
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+
+		bodyDef.position = { 0.0f, 4.0f, 0.0f };
+		bodyDef.rotation = orientation;
+		b3BodyId planeBody = b3CreateBody( m_worldId, &bodyDef );
+
+		b3BoxHull plane = b3MakeBoxHull( 10.0f, 0.5f, 10.0f );
+		shapeDef.baseMaterial.friction = 0.6f;
+		b3CreateHullShape( planeBody, &shapeDef, &plane.base );
+
+		b3Vec3 boxLocalCenter = { 1.0f, 0.5f, 1.0f };
+		b3Vec3 boxOffset = b3RotateVector( orientation, boxLocalCenter );
+
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = { -boxOffset.x, 5.0f - boxOffset.y, -boxOffset.z };
+		bodyDef.rotation = orientation;
+		// bodyDef.angularVelocity = 25.0f * b3RotateVector( orientation, b3Vec3_axisY );
+		b3BodyId boxBody = b3CreateBody( m_worldId, &bodyDef );
+		b3BoxHull mBox = b3MakeOffsetBoxHull( 1.0f, 0.5f, 1.0f, boxLocalCenter );
+		shapeDef.baseMaterial.friction = 0.3f;
+		b3CreateHullShape( boxBody, &shapeDef, &mBox.base );
+
+		b3Body_SetAngularVelocity( boxBody, 25.0f * b3RotateVector( orientation, b3Vec3_axisY ) );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new SlideTwistOffCenterShape( context );
+	}
+};
+
+static int sampleSlideTwistOffCenterShape =
+	RegisterSample( "Issues", "Slide Twist Off Center Shape", SlideTwistOffCenterShape::Create );
+
+// Very large dynamic bodies have overflow when computing the inertia tensor.
+class HugeBox : public Sample
+{
+public:
+	explicit HugeBox( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 0.0f, 25.0f, 10.0f, b3Pos_zero );
+		}
+
+		AddGroundBox( 400.0f );
+
+		{
+			float a = 100.0f;
+
+			b3BoxHull cube = b3MakeCubeHull( a );
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.name = "cube";
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = { 0.0f, a, 0.0f };
+			bodyDef.rotation = b3MakeQuatFromAxisAngle( { 0.0f, 0.0f, 1.0f }, 0.2f );
+			m_bodyId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			b3CreateHullShape( m_bodyId, &shapeDef, &cube.base );
+		}
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new HugeBox( context );
+	}
+
+	b3BodyId m_bodyId;
+};
+
+static int sampleHugeBox = RegisterSample( "Issues", "Huge Box", HugeBox::Create );
+
+// A tilted cylinder whose bounds cover more than 512 height field triangles
+class HeightfieldIssue : public Sample
+{
+public:
+	explicit HeightfieldIssue( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( -90.0f, 5.0f, 50.0f, { 50.0f, 10.0f, 50.0f } );
+		}
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+
+		m_heightField = b3CreateGrid( 100, 100, { 1, 1, 1 }, false );
+		b3BodyId groundId = b3CreateBody( m_worldId, &bodyDef );
+		b3CreateHeightFieldShape( groundId, &shapeDef, m_heightField );
+
+		b3HullData* hull = b3CreateCylinder( 20, 5, -10, 24 );
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = { 50, 20, 50 };
+		bodyDef.rotation = b3MakeQuatFromAxisAngle( b3Vec3_axisX, B3_PI / 4 );
+		b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
+		b3CreateHullShape( bodyId, &shapeDef, hull );
+		b3DestroyHull( hull );
+	}
+
+	~HeightfieldIssue() override
+	{
+		b3DestroyHeightField( m_heightField );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new HeightfieldIssue( context );
+	}
+
+	b3HeightFieldData* m_heightField;
+};
+static int sampleIssueIndex = RegisterSample( "Issues", "Heightfield", HeightfieldIssue::Create );
+
+// Issue #135: the quasi static push out idiom, zero the velocity then step, drives a deeply
+// overlapping body out through a thin static wall instead of back into the room. The solver
+// resolves along the shallow exit, so once the mover center crosses the wall mid plane every
+// step compounds the error outward. Interior is -x, exterior is +x. The wire box marks where
+// a mover resting flush against the interior face belongs.
+// This is NOT a bug. This is just how the separating axis works. I'm keeping this sample
+// in case there is further discussion.
+class ThinWallPushOut : public Sample
+{
+public:
+	static constexpr float m_wallHalfThickness = 0.1f;
+	static constexpr float m_wallHalfHeight = 1.5f;
+	static constexpr float m_moverHalfExtent = 0.5f;
+	static constexpr float m_tolerance = 0.01f;
+
+	explicit ThinWallPushOut( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 20.0f, 15.0f, 6.0f, { 0.0f, m_wallHalfHeight, 0.0f } );
+		}
+
+		// Furniture is dragged into place, never dropped
+		b3World_SetGravity( m_worldId, b3Vec3_zero );
+
+		AddGroundBox( 20.0f );
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+
+		bodyDef.name = "wall";
+		bodyDef.position = { 0.0f, m_wallHalfHeight, 0.0f };
+		b3BodyId wallId = b3CreateBody( m_worldId, &bodyDef );
+
+		b3BoxHull wall = b3MakeBoxHull( m_wallHalfThickness, m_wallHalfHeight, 2.0f );
+		b3CreateHullShape( wallId, &shapeDef, &wall.base );
+
+		bodyDef.name = "mover";
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = { m_startX, m_wallHalfHeight, 0.0f };
+
+		// Velocity is zeroed every step, so without this the mover falls asleep on the first one
+		bodyDef.enableSleep = false;
+
+		// A room planner slides items on the floor plane and yaws them to face a wall
+		bodyDef.motionLocks = { false, true, false, true, false, true };
+		m_moverId = b3CreateBody( m_worldId, &bodyDef );
+
+		b3BoxHull mover = b3MakeBoxHull( m_moverHalfExtent, m_moverHalfExtent, m_moverHalfExtent );
+		shapeDef.baseMaterial.friction = 0.0f;
+		b3CreateHullShape( m_moverId, &shapeDef, &mover.base );
+	}
+
+	void PlaceMover()
+	{
+		b3Body_SetTransform( m_moverId, { m_startX, m_wallHalfHeight, 0.0f }, b3Quat_identity );
+		b3Body_SetLinearVelocity( m_moverId, b3Vec3_zero );
+		b3Body_SetAngularVelocity( m_moverId, b3Vec3_zero );
+	}
+
+	bool DrawControls() override
+	{
+		ImGui::PushItemWidth( 6.0f * ImGui::GetFontSize() );
+
+		// Anywhere past the wall mid plane tunnels out, even while the near face is far deeper
+		bool changed = ImGui::SliderFloat( "Start X", &m_startX, -0.6f, 0.6f, "%.2f" );
+		changed = changed || ImGui::Button( "Reset Mover" );
+
+		if ( changed )
+		{
+			PlaceMover();
+		}
+
+		ImGui::PopItemWidth();
+		return true;
+	}
+
+	void Step() override
+	{
+		// The reported idiom. Zeroing the velocity leaves the penetration correction as the
+		// only thing that can move the body.
+		b3Body_SetLinearVelocity( m_moverId, b3Vec3_zero );
+		b3Body_SetAngularVelocity( m_moverId, b3Vec3_zero );
+
+		Sample::Step();
+
+		float interiorRestX = -m_wallHalfThickness - m_moverHalfExtent;
+		float exteriorRestX = m_wallHalfThickness + m_moverHalfExtent;
+
+		b3Vec3 lower = { interiorRestX - m_moverHalfExtent, m_wallHalfHeight - m_moverHalfExtent,
+						 -m_moverHalfExtent };
+		b3Vec3 upper = { interiorRestX + m_moverHalfExtent, m_wallHalfHeight + m_moverHalfExtent,
+						 m_moverHalfExtent };
+		DrawAabb( lower, upper, MakeColor( b3_colorLime ) );
+
+		float x = (float)b3Body_GetPosition( m_moverId ).x;
+		DrawTextLine( "start x         = %.3f m", m_startX );
+		DrawTextLine( "current x       = %.3f m", x );
+		DrawTextLine( "interior rest x = %.3f m", interiorRestX );
+
+		if ( b3AbsFloat( x - exteriorRestX ) < m_tolerance )
+		{
+			DrawTextLine( "FAIL: mover pushed out of the room" );
+		}
+		else if ( b3AbsFloat( x - interiorRestX ) < m_tolerance )
+		{
+			DrawTextLine( "PASS: mover pushed back into the room" );
+		}
+		else
+		{
+			DrawTextLine( "relaxing ..." );
+		}
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new ThinWallPushOut( context );
+	}
+
+	b3BodyId m_moverId = {};
+	float m_startX = 0.2f;
+};
+
+static int sampleThinWallPushOut =
+	RegisterSample( "Issues", "Thin Wall Push Out", ThinWallPushOut::Create );
+
+// Two crates resting on a rolling deck, one each side of the roll axis: the orange crate with
+// contact recycling (the default), the blue crate with it off for its body.
+//
+// A recycled contact keeps the normal and anchors it was made with, fixed in the world, while each
+// body turns less than B3_CONTACT_RECYCLE_ANGULAR_DISTANCE (10 degrees) from where the contact was
+// made and the two stay within the recycle distance (5 cm). Only the separation is updated. A deck
+// and the cargo resting on it turn together, so their contact is recycled through the roll. Its
+// normal stays the deck's up as it was, and its anchors stay at the same world offsets from each
+// body's center of mass, so the orange crate moves as the deck moves at that fixed spot in space,
+// not as the deck under it moves. It goes straight up and down instead of along its arc, and slides
+// out across the deck by about offset * (1 - cos(roll)). While that stays under the recycle
+// distance the crate sways out and back. Past it (8 m and 8 degrees here, 78 mm) the contact is
+// made again partway through, at the deck's angle then, and frozen there, so the crate walks off
+// across the deck roll by roll. The angular tolerance doesn't stop that: at 12 or 15 degrees the
+// contact is made again more often and the crate walks all the same. The blue crate rides with the
+// deck. The slide arrows on the deck are drawn ten times longer.
+class RollingDeck : public Sample
+{
+public:
+	static constexpr float m_deckHalfLength = 2.0f;
+	static constexpr float m_deckHalfWidth = 10.0f;
+	static constexpr float m_deckHalfThickness = 0.25f;
+	static constexpr float m_crateHalf = 0.5f;
+	static constexpr float m_crateOffset = 8.0f;
+	static constexpr float m_friction = 1.0f;
+	static constexpr float m_settleTime = 1.0f;
+	static constexpr float m_slideScale = 10.0f;
+
+	explicit RollingDeck( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 75.0f, 15.0f, 32.0f, { 0.0f, 0.5f, 0.0f } );
+		}
+
+		m_rollDegrees = 8.0f;
+		m_period = 6.0f;
+		m_deckId = {};
+		m_crateIds[0] = {};
+		m_crateIds[1] = {};
+
+		CreateScene();
+	}
+
+	void CreateScene()
+	{
+		if ( B3_IS_NON_NULL( m_deckId ) )
+		{
+			b3DestroyBody( m_deckId );
+			b3DestroyBody( m_crateIds[0] );
+			b3DestroyBody( m_crateIds[1] );
+		}
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.baseMaterial.friction = m_friction;
+
+		// The deck rolls about the world x axis through its center
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_kinematicBody;
+			m_deckId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3BoxHull box = b3MakeBoxHull( m_deckHalfLength, m_deckHalfThickness, m_deckHalfWidth );
+			shapeDef.baseMaterial.customColor = b3_colorSlateGray;
+			b3CreateHullShape( m_deckId, &shapeDef, &box.base );
+		}
+
+		// The crates rest on the level deck, m_crateOffset either side of the roll axis
+		b3BoxHull box = b3MakeBoxHull( m_crateHalf, m_crateHalf, m_crateHalf );
+		for ( int i = 0; i < 2; ++i )
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = { 0.0f, m_deckHalfThickness + m_crateHalf,
+								 i == 0 ? m_crateOffset : -m_crateOffset };
+
+			// The orange crate recycles its contact with the deck, the blue crate doesn't. Both
+			// stay awake, so a small roll can't put them to sleep.
+			bodyDef.enableContactRecycling = i == 0;
+			bodyDef.enableSleep = false;
+			m_crateIds[i] = b3CreateBody( m_worldId, &bodyDef );
+
+			shapeDef.baseMaterial.customColor = i == 0 ? b3_colorOrange : b3_colorDodgerBlue;
+			b3CreateHullShape( m_crateIds[i], &shapeDef, &box.base );
+
+			m_start[i] = b3Vec3_zero;
+			m_maxSlide[i] = 0.0f;
+			m_maxNormalError[i] = 0.0f;
+		}
+
+		m_time = 0.0f;
+		m_started = false;
+	}
+
+	// The roll angle in radians at a time since the start: still while the crates settle, then
+	// rolling, eased in over the first quarter roll so the crates aren't jolted by a deck starting
+	// at full speed.
+	float RollAngle( float time ) const
+	{
+		float t = time - m_settleTime;
+		if ( t <= 0.0f )
+		{
+			return 0.0f;
+		}
+
+		float ease = 1.0f;
+		if ( t < 0.25f * m_period )
+		{
+			float u = t / ( 0.25f * m_period );
+			ease = u * u * ( 3.0f - 2.0f * u );
+		}
+
+		return ease * m_rollDegrees * B3_PI / 180.0f * sinf( 2.0f * B3_PI * t / m_period );
+	}
+
+	bool DrawControls() override
+	{
+		// Changing the roll starts the scene again, so the contacts are made with the deck level.
+		ImGui::SliderFloat( "Roll (deg)", &m_rollDegrees, 0.0f, 15.0f, "%.1f" );
+		if ( ImGui::IsItemDeactivatedAfterEdit() )
+		{
+			CreateScene();
+		}
+
+		ImGui::SliderFloat( "Period (s)", &m_period, 2.0f, 12.0f, "%.1f" );
+		if ( ImGui::IsItemDeactivatedAfterEdit() )
+		{
+			CreateScene();
+		}
+
+		if ( ImGui::Button( "Reset" ) )
+		{
+			CreateScene();
+		}
+
+		return true;
+	}
+
+	void Step() override
+	{
+		float timeStep = m_context->hertz > 0.0f ? 1.0f / m_context->hertz : 0.0f;
+		if ( m_context->pause && m_context->singleStep == 0 )
+		{
+			timeStep = 0.0f;
+		}
+
+		if ( timeStep > 0.0f )
+		{
+			b3Quat rotation =
+				b3MakeQuatFromAxisAngle( b3Vec3_axisX, RollAngle( m_time + timeStep ) );
+			b3Body_SetTargetTransform( m_deckId, { { 0.0f, 0.0f, 0.0f }, rotation }, timeStep,
+									   true );
+		}
+
+		Sample::Step();
+
+		m_time += timeStep;
+
+		// Where the crates settled, in the deck's frame, measured from as the deck starts to roll
+		if ( m_started == false && m_time >= m_settleTime )
+		{
+			for ( int i = 0; i < 2; ++i )
+			{
+				m_start[i] = b3Body_GetLocalPoint( m_deckId, b3Body_GetPosition( m_crateIds[i] ) );
+			}
+			m_started = true;
+		}
+
+		b3Vec3 deckUp = b3Body_GetWorldVector( m_deckId, b3Vec3_axisY );
+		float slide[2] = { 0.0f, 0.0f };
+		float normalError[2] = { 0.0f, 0.0f };
+
+		for ( int i = 0; i < 2; ++i )
+		{
+			Vec4 color = i == 0 ? MakeColor( b3_colorOrange ) : MakeColor( b3_colorDodgerBlue );
+			b3Pos center = b3Body_GetPosition( m_crateIds[i] );
+
+			// The deck's up (white) and the crate's contact normal (in the crate's color), from the
+			// crate's center
+			DrawArrow( center, b3OffsetPos( center, b3MulSV( 2.5f, deckUp ) ),
+					   MakeColor( b3_colorWhite ) );
+
+			b3ContactData contactData;
+			if ( b3Body_GetContactData( m_crateIds[i], &contactData, 1 ) == 1 &&
+				 contactData.manifoldCount > 0 )
+			{
+				b3Vec3 normal = contactData.manifolds[0].normal;
+				if ( b3Dot( normal, deckUp ) < 0.0f )
+				{
+					normal = b3Neg( normal );
+				}
+
+				DrawArrow( center, b3OffsetPos( center, b3MulSV( 2.5f, normal ) ), color );
+				normalError[i] =
+					acosf( b3MinFloat( b3Dot( normal, deckUp ), 1.0f ) ) * 180.0f / B3_PI;
+			}
+
+			DrawString3D( b3OffsetPos( center, b3MulSV( 3.0f, deckUp ) ), color, "%s",
+						  i == 0 ? "recycling on" : "recycling off" );
+
+			if ( m_started == false )
+			{
+				continue;
+			}
+
+			// Where the crate settled, outlined on the deck's top, and how far it has slid from
+			// there across the deck, drawn m_slideScale times longer
+			b3Vec3 local = b3Body_GetLocalPoint( m_deckId, center );
+			b3Vec3 offset = b3Sub( local, m_start[i] );
+			offset.y = 0.0f;
+			slide[i] = b3Length( offset );
+
+			float top = m_deckHalfThickness + 0.01f;
+			b3Vec3 mark = { m_start[i].x, top, m_start[i].z };
+			b3Vec3 corners[4] = {
+				{ mark.x - m_crateHalf, top, mark.z - m_crateHalf },
+				{ mark.x + m_crateHalf, top, mark.z - m_crateHalf },
+				{ mark.x + m_crateHalf, top, mark.z + m_crateHalf },
+				{ mark.x - m_crateHalf, top, mark.z + m_crateHalf },
+			};
+			for ( int j = 0; j < 4; ++j )
+			{
+				DrawLine( b3Body_GetWorldPoint( m_deckId, corners[j] ),
+						  b3Body_GetWorldPoint( m_deckId, corners[( j + 1 ) % 4] ), color );
+			}
+
+			b3Vec3 tip = b3MulAdd( mark, m_slideScale, offset );
+			DrawArrow( b3Body_GetWorldPoint( m_deckId, mark ),
+					   b3Body_GetWorldPoint( m_deckId, tip ), color );
+
+			m_maxSlide[i] = b3MaxFloat( m_maxSlide[i], slide[i] );
+			m_maxNormalError[i] = b3MaxFloat( m_maxNormalError[i], normalError[i] );
+		}
+
+		float roll = RollAngle( m_time ) * 180.0f / B3_PI;
+		float expected = m_crateOffset * ( 1.0f - cosf( m_rollDegrees * B3_PI / 180.0f ) );
+
+		DrawTextLine( "deck rolls %.1f deg each way every %.1f s (now %+.1f deg), crates %.0f m "
+					  "from the roll axis, friction %.0f",
+					  m_rollDegrees, m_period, roll, m_crateOffset, m_friction );
+		DrawTextLine( "a contact is recycled while each body turns < 10 deg from where it was made "
+					  "(B3_CONTACT_RECYCLE_ANGULAR_DISTANCE)" );
+		DrawTextLine( "contacts recycled this step: %d (only the orange crate's can be)",
+					  b3World_GetCounters( m_worldId ).recycledContactCount );
+		DrawTextLine( "orange, recycling on : normal %4.1f deg off the deck's up (most %4.1f), "
+					  "slid %5.1f mm (most %5.1f)",
+					  normalError[0], m_maxNormalError[0], 1000.0f * slide[0],
+					  1000.0f * m_maxSlide[0] );
+		DrawTextLine( "blue,   recycling off: normal %4.1f deg off the deck's up (most %4.1f), "
+					  "slid %5.1f mm (most %5.1f)",
+					  normalError[1], m_maxNormalError[1], 1000.0f * slide[1],
+					  1000.0f * m_maxSlide[1] );
+		DrawTextLine(
+			"recycled, the crate moves straight up and down: offset * (1 - cos(roll)) = %.1f mm at "
+			"each end; past the "
+			"%.0f cm recycle distance the contact is made again tilted and the crate walks off",
+			1000.0f * expected, 100.0f * b3World_GetContactRecycleDistance( m_worldId ) );
+		DrawTextLine( "arrows: white is the deck's up, colored is the contact normal; slide arrows "
+					  "on the deck are drawn %.0fx",
+					  m_slideScale );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new RollingDeck( context );
+	}
+
+	b3BodyId m_deckId;
+	b3BodyId m_crateIds[2];
+	b3Vec3 m_start[2];
+	float m_maxSlide[2];
+	float m_maxNormalError[2];
+	float m_rollDegrees;
+	float m_period;
+	float m_time;
+	bool m_started;
+};
+
+static int sampleRollingDeck = RegisterSample( "Issues", "Rolling Deck", RollingDeck::Create );
+
+// A car made of one dynamic box (the chassis) and four ray cast 'wheels'.
+// There are no wheel bodies and no joints.
+
+// W/S to drive, A/D to steer and Space to brake. T toggles a camera that follows the car.
+
+// Each step every wheel casts a ray down the chassis' own down axis. Where a ray hits the ground
+// the wheel applies two forces to the chassis at the contact point:
+// - a spring and damper force along the contact normal, which holds the chassis up
+// - a tyre force in the contact plane, which drives, brakes and stops the wheel sliding sideways
+// The tyre force is limited by friction times the spring force, so a wheel that is lightly loaded
+// grips less. Weight transfer, body roll and rollover come from where these forces are applied.
+class RaycastVehicle : public Sample
+{
+public:
+	static constexpr int m_wheelCount = 4;
+	static constexpr uint64_t m_vehicleBit = 0x2;
+
+	struct Wheel
+	{
+		b3Vec3 localMount;
+		bool steered;
+
+		// Distance from the mount down to the wheel's center
+		float suspensionLength;
+		bool grounded;
+
+		// Rotation about the axle, for drawing only
+		float spinAngle;
+		float spinSpeed;
+	};
+
+	explicit RaycastVehicle( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 25.0f, 20.0f, 12.0f, { 0.0f, 1.0f, 0.0f } );
+		}
+
+		m_suspensionHertz = 1.5f;
+		m_suspensionDampingRatio = 0.45f;
+		m_friction = 1.0f;
+		m_wheelRadius = 0.35f;
+		m_suspensionTravel = 0.3f;
+		m_engineAcceleration = 5.0f;
+		m_brakeDeceleration = 8.0f;
+		m_maxSteeringAngle = 0.15f * B3_PI;
+		m_steeringAngle = 0.0f;
+
+		AddGroundBox( 100.0f );
+
+		// A ramp to show the suspension working
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.position = { 15.0f, -0.5f, 0.0f };
+			bodyDef.rotation = b3MakeQuatFromAxisAngle( b3Vec3_axisZ, 0.1f );
+			b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			b3BoxHull box = b3MakeBoxHull( 6.0f, 0.5f, 4.0f );
+			b3CreateHullShape( bodyId, &shapeDef, &box.base );
+		}
+
+		// The chassis is the only body. Its shape has its own category so the wheel rays can skip
+		// it.
+		float halfLength = 2.2f;
+		float halfHeight = 0.7f;
+		float halfWidth = 0.9f;
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = { 0.0f, 1.2f, 0.0f };
+			m_chassisId = b3CreateBody( m_worldId, &bodyDef );
+
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			shapeDef.density = 130.0f;
+			shapeDef.filter.categoryBits = m_vehicleBit;
+			b3BoxHull box = b3MakeBoxHull( halfLength, halfHeight, halfWidth );
+			b3CreateHullShape( m_chassisId, &shapeDef, &box.base );
+
+			// A car tips over when its lateral acceleration exceeds half the track width divided by
+			// the height of its center of mass. At the middle of this box the center of mass would
+			// be about as high as the half track, and the car would roll before its tyres slide.
+			// Lower it to near the floor, where the heavy parts of a car are.
+			b3MassData massData = b3Body_GetMassData( m_chassisId );
+			massData.center = { 0.0f, -0.45f, 0.0f };
+			b3Body_SetMassData( m_chassisId, massData );
+		}
+
+		// The mounts are the top of each wheel's travel, inside the chassis at the sides. +x is
+		// forward.
+		float axle = 0.75f * halfLength;
+		float mountHeight = -0.3f;
+		m_wheels[0] = { { axle, mountHeight, halfWidth }, true, m_suspensionTravel };
+		m_wheels[1] = { { axle, mountHeight, -halfWidth }, true, m_suspensionTravel };
+		m_wheels[2] = { { -axle, mountHeight, halfWidth }, false, m_suspensionTravel };
+		m_wheels[3] = { { -axle, mountHeight, -halfWidth }, false, m_suspensionTravel };
+
+		// A cylinder along its y axis, centered, for drawing the wheels
+		float wheelWidth = 0.25f;
+		m_wheelHull = b3CreateCylinder( wheelWidth, m_wheelRadius, -0.5f * wheelWidth, 12 );
+	}
+
+	~RaycastVehicle() override
+	{
+		b3DestroyHull( m_wheelHull );
+
+		if ( m_camera->m_thirdPerson )
+		{
+			ToggleThirdPerson();
+		}
+	}
+
+	void Keyboard( int key, int action, int mods ) override
+	{
+		if ( key == KEY_T && action == ACTION_PRESS )
+		{
+			ToggleThirdPerson();
+		}
+	}
+
+	bool DrawControls() override
+	{
+		ImGui::SliderFloat( "Suspension Hertz", &m_suspensionHertz, 0.5f, 5.0f, "%.1f" );
+		ImGui::SliderFloat( "Suspension Damping", &m_suspensionDampingRatio, 0.0f, 2.0f, "%.2f" );
+		ImGui::SliderFloat( "Tyre Friction", &m_friction, 0.0f, 2.0f, "%.2f" );
+
+		bool thirdPerson = m_camera->m_thirdPerson;
+		if ( ImGui::Checkbox( "Third Person (T)", &thirdPerson ) )
+		{
+			ToggleThirdPerson();
+		}
+
+		return true;
+	}
+
+	// Apply the forces of every wheel to the chassis for the coming step
+	void UpdateWheels( float timeStep, float throttle, float brake, float steer )
+	{
+		b3WorldTransform transform = b3Body_GetTransform( m_chassisId );
+		b3Vec3 forward = b3RotateVector( transform.q, b3Vec3_axisX );
+
+		// The acceleration the driver asks for along the chassis' nose. The brake opposes the
+		// chassis' motion and is capped at what stops it this step, so it never drives it
+		// backwards.
+		float speed = b3Dot( b3Body_GetLinearVelocity( m_chassisId ), forward );
+		float acceleration = m_engineAcceleration * throttle;
+		float stopping = b3MinFloat( m_brakeDeceleration * brake, b3AbsFloat( speed ) / timeStep );
+		acceleration -= speed > 0.0f ? stopping : -stopping;
+
+		for ( int i = 0; i < m_wheelCount; ++i )
+		{
+			UpdateWheel( m_wheels[i], transform, timeStep, acceleration, steer );
+		}
+	}
+
+	// Cast one wheel's ray and apply its suspension and tyre forces to the chassis
+	void UpdateWheel( Wheel& wheel, b3WorldTransform transform, float timeStep, float acceleration,
+					  float steer )
+	{
+		b3Vec3 up = b3RotateVector( transform.q, b3Vec3_axisY );
+		b3Vec3 forward = b3RotateVector( transform.q, b3Vec3_axisX );
+
+		// The ray reaches from the mount down through the spring's travel and the wheel's radius
+		float reach = m_suspensionTravel + m_wheelRadius;
+		b3Vec3 translation = b3MulSV( -reach, up );
+
+		b3QueryFilter filter = b3DefaultQueryFilter();
+		filter.categoryBits = m_vehicleBit;
+		filter.maskBits = ~m_vehicleBit;
+
+		b3Pos mount = b3TransformWorldPoint( transform, wheel.localMount );
+		b3RayResult hit = b3World_CastRayClosest( m_worldId, mount, translation, filter );
+		wheel.grounded = hit.hit;
+		float fraction = hit.hit ? hit.fraction : 1.0f;
+		wheel.suspensionLength = fraction * reach - m_wheelRadius;
+
+		// A wheel turns at the speed of the ground under it, and keeps that speed in the air
+		wheel.spinAngle = b3UnwindAngle( wheel.spinAngle + wheel.spinSpeed * timeStep );
+
+		if ( hit.hit == false )
+		{
+			return;
+		}
+
+		// Each wheel carries an equal share of the mass. The spring rate gives that share the
+		// requested natural frequency.
+		float share = b3Body_GetMass( m_chassisId ) / m_wheelCount;
+		float omega = 2.0f * B3_PI * m_suspensionHertz;
+		float stiffness = share * omega * omega;
+		float damping = 2.0f * m_suspensionDampingRatio * share * omega;
+
+		// Suspension. A spring only pushes: a negative load would pull the chassis onto the
+		// ground and hold it there through a jump.
+		float compression = ( 1.0f - hit.fraction ) * reach;
+		float compressionSpeed = -b3Dot( b3Body_GetWorldPointVelocity( m_chassisId, mount ), up );
+		float load = b3MaxFloat( stiffness * compression + damping * compressionSpeed, 0.0f );
+		b3Body_ApplyForce( m_chassisId, b3MulSV( load, hit.normal ), hit.point, true );
+
+		// The wheel's rolling direction in the contact plane, and the direction across it
+		b3Vec3 heading = forward;
+		if ( wheel.steered )
+		{
+			heading = b3RotateVector( b3MakeQuatFromAxisAngle( up, steer ), forward );
+		}
+		b3Vec3 rolling =
+			b3Normalize( b3MulAdd( heading, -b3Dot( heading, hit.normal ), hit.normal ) );
+		b3Vec3 lateral = b3Cross( hit.normal, rolling );
+
+		// The lateral force cancels the contact point's sideways sliding in one step. The rolling
+		// force gives this wheel's share of the mass the requested acceleration, resolved onto the
+		// wheel, so a steered wheel puts less of it into the nose direction.
+		b3Vec3 contactVelocity = b3Body_GetWorldPointVelocity( m_chassisId, hit.point );
+		float lateralForce = -share * b3Dot( contactVelocity, lateral ) / timeStep;
+		float rollingForce = share * acceleration * b3Dot( forward, rolling );
+
+		// Rolling forward along +x turns the wheel backwards about its axle, the chassis' +z
+		wheel.spinSpeed = -b3Dot( contactVelocity, rolling ) / m_wheelRadius;
+
+		// Friction circle: the tyre cannot give more than friction times the load on it
+		float maxForce = m_friction * load;
+		float magnitude = sqrtf( lateralForce * lateralForce + rollingForce * rollingForce );
+		if ( magnitude > maxForce )
+		{
+			lateralForce *= maxForce / magnitude;
+			rollingForce *= maxForce / magnitude;
+		}
+
+		b3Vec3 tyreForce =
+			b3Add( b3MulSV( rollingForce, rolling ), b3MulSV( lateralForce, lateral ) );
+		b3Body_ApplyForce( m_chassisId, tyreForce, hit.point, true );
+	}
+
+	void Step() override
+	{
+		float throttle = 0.0f;
+		throttle += IsKeyDown( KEY_W ) ? 1.0f : 0.0f;
+		throttle -= IsKeyDown( KEY_S ) ? 1.0f : 0.0f;
+		float brake = IsKeyDown( KEY_SPACE ) ? 1.0f : 0.0f;
+
+		m_steeringAngle = 0.0f;
+		m_steeringAngle += IsKeyDown( KEY_A ) ? m_maxSteeringAngle : 0.0f;
+		m_steeringAngle -= IsKeyDown( KEY_D ) ? m_maxSteeringAngle : 0.0f;
+
+		// Forces accumulate until the world steps, so apply them only on a step that runs
+		bool stepping = m_context->pause == false || m_context->singleStep > 0;
+		if ( stepping && m_context->hertz > 0.0f )
+		{
+			UpdateWheels( 1.0f / m_context->hertz, throttle, brake, m_steeringAngle );
+		}
+
+		if ( m_camera->m_thirdPerson )
+		{
+			m_camera->m_pivot = b3Body_GetPosition( m_chassisId );
+			m_camera->UpdateTransform();
+		}
+
+		Sample::Step();
+	}
+
+	void Render() override
+	{
+		Sample::Render();
+
+		b3WorldTransform transform = b3Body_GetTransform( m_chassisId );
+		b3Vec3 down = b3RotateVector( transform.q, b3Neg( b3Vec3_axisY ) );
+
+		// The wheel cylinder is along y. This turns it onto the axle, the chassis' z.
+		b3Quat cylinderToAxle = b3MakeQuatFromAxisAngle( b3Vec3_axisX, 0.5f * B3_PI );
+
+		for ( int i = 0; i < m_wheelCount; ++i )
+		{
+			const Wheel& wheel = m_wheels[i];
+			b3Pos mount = b3TransformWorldPoint( transform, wheel.localMount );
+			b3Pos center = b3OffsetPos( mount, b3MulSV( wheel.suspensionLength, down ) );
+
+			float steer = wheel.steered ? m_steeringAngle : 0.0f;
+			b3Quat q = b3MulQuat( transform.q, b3MakeQuatFromAxisAngle( b3Vec3_axisY, steer ) );
+			q = b3MulQuat( q, b3MakeQuatFromAxisAngle( b3Vec3_axisZ, wheel.spinAngle ) );
+			q = b3MulQuat( q, cylinderToAxle );
+
+			b3HexColor color = wheel.grounded ? b3_colorGreen : b3_colorRed;
+			DrawLine( mount, center, MakeColor( color ) );
+			DrawHull( { center, q }, m_wheelHull, MakeColor( b3_colorGray ) );
+		}
+
+		b3Vec3 forward = b3RotateVector( b3Body_GetRotation( m_chassisId ), b3Vec3_axisX );
+		float speed = b3Dot( b3Body_GetLinearVelocity( m_chassisId ), forward );
+		DrawTextLine( "speed = %.1f m/s", speed );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new RaycastVehicle( context );
+	}
+
+	b3BodyId m_chassisId;
+	Wheel m_wheels[m_wheelCount];
+	b3HullData* m_wheelHull;
+
+	float m_suspensionHertz;
+	float m_suspensionDampingRatio;
+	float m_friction;
+	float m_wheelRadius;
+	float m_suspensionTravel;
+	float m_engineAcceleration;
+	float m_brakeDeceleration;
+	float m_maxSteeringAngle;
+	float m_steeringAngle;
+};
+
+static int sampleRaycastVehicle =
+	RegisterSample( "Vehicle", "Raycast Vehicle", RaycastVehicle::Create );

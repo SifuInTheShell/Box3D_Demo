@@ -5,12 +5,14 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-#include "imgui.h"
-#include "utils.h"
-#include "sample.h"
 #include "gfx/draw.h"
+#include "imgui.h"
+#include "sample.h"
+#include "utils.h"
 
 #include "box3d/box3d.h"
+
+#include "dynamic_tree.h"
 
 #include <queue>
 #include <stdio.h>
@@ -63,6 +65,7 @@ public:
 
 		m_closestPoint = b3Pos_zero;
 		m_timeStamp = 1;
+		m_drawLevel = -1;
 		m_doOverlap = false;
 		m_doClosest = false;
 		m_doRay = false;
@@ -87,40 +90,55 @@ public:
 	}
 
 	// Breath-first search to compute node depth values start with 0 at the root.
+	// The tree is walked a sibling pair at a time, so depth is tracked alongside
+	// each queued pair rather than looked up through the parent index.
 	int ComputeDepths()
 	{
 		m_depths.resize( m_tree.nodeCapacity, 0 );
 
-		int* queue = (int*)malloc( m_tree.nodeCount * sizeof( int ) );
+		if ( m_tree.nodes == nullptr || m_tree.proxyCount == 0 )
+		{
+			return 0;
+		}
+
+		b3TreeNode* nodes = m_tree.nodes;
+		m_depths[B3_ROOT_NODE] = 0;
+
+		if ( b3IsLeaf( nodes + B3_ROOT_NODE ) )
+		{
+			return 0;
+		}
+
+		struct QueueItem
+		{
+			int pair;
+			int depth;
+		};
+
+		QueueItem* queue = (QueueItem*)malloc( m_tree.nodeEnd * sizeof( QueueItem ) );
 		int front = 0;
 		int back = 0;
 
-		b3TreeNode* nodes = m_tree.nodes;
-		queue[0] = m_tree.root;
-		back += 1;
+		queue[back++] = { b3GetLeftChild( nodes + B3_ROOT_NODE ), 1 };
+
 		int depth = 0;
 
 		while ( back > front )
 		{
-			int index = queue[front];
-			front += 1;
+			QueueItem item = queue[front++];
+			depth = b3MaxInt( depth, item.depth );
 
-			b3TreeNode* node = nodes + index;
-			if ( node->parent == B3_NULL_INDEX )
+			for ( int i = 0; i < 2; ++i )
 			{
-				m_depths[index] = 0;
-			}
-			else
-			{
-				m_depths[index] = m_depths[node->parent] + 1;
-				depth = b3MaxInt( depth, m_depths[index] );
-			}
+				int index = item.pair + i;
+				b3TreeNode* node = nodes + index;
+				m_depths[index] = item.depth;
 
-			if ( ( node->flags & b3_leafNode ) == 0 )
-			{
-				B3_ASSERT( back < m_tree.nodeCount - 1 );
-				queue[back++] = node->children.child1;
-				queue[back++] = node->children.child2;
+				if ( b3IsLeaf( node ) == false )
+				{
+					B3_ASSERT( back < m_tree.nodeEnd );
+					queue[back++] = { b3GetLeftChild( node ), item.depth + 1 };
+				}
 			}
 		}
 
@@ -149,6 +167,7 @@ public:
 		FILE* file = fopen( filePath, "r" );
 		if ( file == nullptr )
 		{
+			fprintf( stderr, "Failed to open '%s'\n", filePath );
 			return;
 		}
 
@@ -217,6 +236,13 @@ public:
 			// }
 		}
 
+		fclose( file );
+
+		if ( m_proxies.empty() )
+		{
+			return;
+		}
+
 		printf( "max index = %d\n", maxAreaIndex );
 
 		// constexpr int n = m_isDebug ? 1000 : INT_MAX;
@@ -252,26 +278,32 @@ public:
 		m_proxies.clear();
 
 		{
-			//bool zUp = true;
+			// bool zUp = true;
 			m_tree = b3DynamicTree_Load( m_saveFileName, m_loadScale );
 		}
 
-		constexpr int bufferSize = 512;
-		char buffer[bufferSize];
+		// A missing or stale save file loads as an empty tree, which has no root to walk
+		if ( m_tree.nodes == nullptr || m_tree.proxyCount == 0 )
+		{
+			fprintf( stderr, "Failed to load tree '%s'\n", m_saveFileName );
+			m_height = 0;
+			m_drawLevel = -1;
+			m_buildTime = 0.0f;
+			m_areaRatio = 0.0f;
+			return;
+		}
 
 		int maxArea = 0.0f;
 		int maxAreaIndex = -1;
 
-		for ( int i = 0; i < m_tree.nodeCapacity; ++i )
+		for ( int i = 0; i < m_tree.nodeEnd; ++i )
 		{
 			b3TreeNode* node = m_tree.nodes + i;
 
-			if ( ( node->flags & b3_leafNode ) == 0 )
+			if ( b3IsLeaf( node ) == false || b3IsEmptyNode( node ) )
 			{
 				continue;
 			}
-
-			assert( node->flags & b3_allocatedNode );
 
 			Proxy proxy = {};
 			proxy.aabb = node->aabb;
@@ -283,8 +315,9 @@ public:
 				maxAreaIndex = (int)m_proxies.size();
 			}
 
-			proxy.proxyId = i;
-			m_proxies[node->userData] = proxy;
+			int proxyId = b3GetProxyId( node );
+			proxy.proxyId = proxyId;
+			m_proxies[m_tree.proxies[proxyId].userData] = proxy;
 		}
 
 		printf( "max index = %d\n", maxAreaIndex );
@@ -341,7 +374,7 @@ public:
 	{
 		srand( 42 );
 
-		b3AABB bounds = m_tree.nodes[m_tree.root].aabb;
+		b3AABB bounds = m_tree.nodes[B3_ROOT_NODE].aabb;
 		b3Vec3 extents = b3AABB_Extents( bounds );
 		float radius = ( extents.x + extents.y + extents.z ) / 3.0f;
 
@@ -406,6 +439,11 @@ public:
 
 	bool DrawControls() override
 	{
+		if ( m_tree.proxyCount == 0 )
+		{
+			return false;
+		}
+
 		DrawTextLine( "leaves = %d, height = %d, area = %g", m_tree.proxyCount, m_height, m_areaRatio );
 		DrawTextLine( "build time = %g ms", m_buildTime );
 		DrawTextLine( "total: ray = %g ms, overlap = %g ms, closest = %g ms", m_rayTime, m_overlapTime, m_closestTime );
@@ -463,6 +501,11 @@ public:
 
 		DrawAxes( b3WorldTransform_identity, 2.0f );
 
+		if ( m_tree.proxyCount == 0 )
+		{
+			return;
+		}
+
 		b3Pos cp = m_camera->DrawOrigin();
 		b3TreeNode* nodes = m_tree.nodes;
 		float distSquared = m_drawDistance * m_drawDistance * 1000.0f * 1000.0f;
@@ -477,13 +520,11 @@ public:
 				b3_colorCoral,	   b3_colorCornflowerBlue, b3_colorCornsilk,	   b3_colorCrimson,	   b3_colorCyan,
 			};
 
-			int capacity = m_tree.nodeCapacity;
-			for ( int i = 0; i < capacity; ++i )
+			for ( int i = 0; i < m_tree.nodeEnd; ++i )
 			{
 				b3TreeNode* node = nodes + i;
-				if ( m_depths[i] != m_drawLevel || ( node->flags & b3_allocatedNode ) == 0 )
+				if ( m_depths[i] != m_drawLevel || b3IsEmptyNode( node ) )
 				{
-					// skip internal nodes
 					continue;
 				}
 
@@ -496,12 +537,13 @@ public:
 		}
 		else
 		{
-			uint16_t requiredFlags = b3_allocatedNode | b3_leafNode;
-			for ( int i = 0; i < m_tree.nodeCapacity; ++i )
+			// Live leaves only. A mark on a leaf says its ancestors still need a refit, the
+			// leaf box itself is already current, so moved leaves still draw.
+			for ( int i = 0; i < m_tree.nodeEnd; ++i )
 			{
 				b3TreeNode* node = nodes + i;
 
-				if ( node->flags != requiredFlags )
+				if ( b3IsEmptyNode( node ) || b3IsLeaf( node ) == false )
 				{
 					continue;
 				}
@@ -512,7 +554,7 @@ public:
 					continue;
 				}
 
-				Proxy& proxy = m_proxies[node->userData];
+				Proxy& proxy = m_proxies[m_tree.proxies[b3GetProxyId( node )].userData];
 				if ( proxy.queryTimeStamp == m_timeStamp || proxy.rayTimeStamp == m_timeStamp )
 				{
 					DrawBounds( node->aabb, 0.0f, MakeColor( b3_colorLightGray ) );
@@ -550,8 +592,14 @@ public:
 	void Step() override
 	{
 		Sample::Step();
+
+		if ( m_tree.proxyCount == 0 )
+		{
+			return;
+		}
+
 		++m_timeStamp;
-		
+
 		if ( m_doRay )
 		{
 			Ray ray = m_rays[m_testIndex];
@@ -599,9 +647,11 @@ public:
 	std::unordered_map<uint64_t, Proxy> m_proxies;
 	std::vector<uint16_t> m_depths;
 	b3DynamicTree m_tree;
-	Ray m_rays[m_testCount];
-	b3AABB m_overlapQueries[m_testCount];
-	b3Sphere m_closestPointQueries[m_testCount];
+
+	// Zeroed because the queries are only generated once a tree loads
+	Ray m_rays[m_testCount] = {};
+	b3AABB m_overlapQueries[m_testCount] = {};
+	b3Sphere m_closestPointQueries[m_testCount] = {};
 	b3Pos m_closestPoint;
 	float m_areaRatio;
 	float m_rayTime;

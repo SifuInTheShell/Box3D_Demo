@@ -44,6 +44,24 @@ for orientation and 3x3 inertia tensors for rotational dynamics. If you come acr
 understand, please read about it on Wikipedia. Visit this [page](https://box2d.org/publications/) if you want a deeper
 knowledge of the algorithms used in Box3D.
 
+### Working with Unreal
+
+You can use Box3D in Unreal as a plug-in. Here is the module file I use:
+
+[Box3D module](https://gist.github.com/erincatto/6f08df5f1e6e9a79fb4be6298a3e1125)
+
+Unreal uses centimeters as units while Box3D has tolerances tuned for meters. You can either scale dimensions you send and recieve from Box3D or you can use this to set the length units:
+
+```c
+b3SetLengthUnitsPerMeter(100.0f);
+```
+
+This doesn't scale the units. Instead it scales the tolerances used internally in Box3D to be more appropriate for centimeters.
+
+Another issue is that Box3D is right-handed while Unreal is left-handed. Box3D has way too much math for it to be reasonable to support a left-handed option. However, it doesn't matter. In practice you don't need to do any conversions. Box3D will run in a mirrored world and the outputs from Box3D are fully compatible with the Unreal coordinates.
+
+I would just be careful about using Box3D math functions like `b3Cross` and expecting it to give the same result as the Unreal cross product.
+
 ## API
 
 ### What units does Box3D use?
@@ -102,6 +120,41 @@ constraints. Box3D also uses [Semi-implicit Euler](https://en.wikipedia.org/wiki
 approximately solve the differential equations. Box3D also does not have exact collision between dynamic shapes. Slow
 moving shapes may have small overlap for a few time steps. In extreme stacking scenarios, shapes may have sustained
 overlap.
+
+## Shapes
+
+### Why doesn't Box3D have a cylinder shape?
+
+Cylinders look simple but they are one of the hardest shapes to make work well in a 3D physics engine. Other engines
+that support cylinders tend to document them as their least stable shape. A cylinder combines three kinds of geometry
+that each need different handling:
+
+* flat caps, like a polytope
+* a sharp circular rim, like an edge that is curved
+* a curved side, like a capsule that has no rounded ends
+
+These cause several problems:
+
+**Collision algorithms don't fit.** The other shapes in Box3D fall into two families. Spheres and capsules are a point
+or a segment with a radius, so their collision is closed form and exact. Convex hulls have a finite set of faces and
+edges, so Box3D can find the separating axis directly and clip faces to build a contact manifold. A cylinder belongs to
+neither family. Its side has infinitely many face normals, and the rim is a curved edge. Testing the rim against a box
+edge means solving a quartic. So engines fall back on GJK with a support function, which converges slowly on smooth
+shapes. They also need extra machinery such as EPA or shrunken cores with margins for overlapping shapes.
+
+GJK only gives one contact point but a cylinder resting on the end cap needs at least 4 points. Some physics engines
+just clip a predefined polygon. In this case it is not really a cylinder being simulated.
+
+### What should I use instead of a cylinder?
+
+It depends on what the cylinder is for:
+* **Barrels, logs, and pipes that roll:** a capsule rolls perfectly smoothly on its side. The rounded ends are often not
+  noticeable. Box3D supports rolling resistance for capsules as well.
+* **Wheels:** use a sphere for the wheel collision, together with a wheel joint or revolute joint. A sphere rolls
+  perfectly and is the cheapest shape to collide. Box3D can reject ghost collisions between spheres and internal mesh edges.
+  Many vehicle setups instead skip wheel collision entirely and use ray casts or shape casts to find the ground.
+* **Pillars, coins, and anything that mostly rests on its cap:** use a hull from `b3CreateCylinder()`. It makes a
+  tessellated cylinder along the y-axis with between 3 and 32 sides. Use the fewest sides that looks acceptable.
 
 ## Making Games
 

@@ -34,6 +34,16 @@ FetchContent_Declare(nfd
 )
 FetchContent_MakeAvailable(nfd)
 
+# meshoptimizer for the s&box Ghost Collisions remesh toggle. Static lib, target meshoptimizer.
+set(MESHOPT_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(meshoptimizer
+    GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
+    GIT_TAG        v1.3
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
+)
+FetchContent_MakeAvailable(meshoptimizer)
+
 # The shader compiler is only needed when recompiling shaders. A fresh clone
 # with BOX3D_BUILD_SHADERS=OFF builds from the committed headers and skips this.
 if(BOX3D_BUILD_SHADERS)
@@ -74,6 +84,20 @@ add_library(implot STATIC
 target_link_libraries(implot PUBLIC imgui)
 target_include_directories(implot SYSTEM PUBLIC "${implot_SOURCE_DIR}")
 set_target_properties(implot PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# ImGuizmo vendored from github.com/CedricGuillemet/ImGuizmo at 18cef5e (2026-08-08), ImGuizmo.cpp/.h only.
+add_library(imguizmo STATIC
+    "${CMAKE_SOURCE_DIR}/extern/imguizmo/ImGuizmo.cpp"
+    "${CMAKE_SOURCE_DIR}/extern/imguizmo/ImGuizmo.h"
+)
+target_link_libraries(imguizmo PUBLIC imgui)
+target_include_directories(imguizmo SYSTEM PUBLIC "${CMAKE_SOURCE_DIR}/extern/imguizmo")
+set_target_properties(imguizmo PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF
@@ -155,8 +179,10 @@ set(SAMPLE_FILES
     sample.h
     mesh_loader.cpp
     mesh_loader.h
-    mover.cpp
-    mover.h
+    dynamic_mover.cpp
+    dynamic_mover.h
+    geometric_mover.cpp
+    geometric_mover.h
     jsmn.h
     tiny_obj_loader.h
     earcut.h
@@ -171,12 +197,14 @@ set(SAMPLE_FILES
     sample_determinism.cpp
     sample_events.cpp
     sample_geometry.cpp
+    sample_ghost.cpp
     sample_issues.cpp
     sample_joint.cpp
     sample_manifold.cpp
     sample_mesh.cpp
     sample_ragdoll.cpp
     sample_replay.cpp
+    sample_restitution.cpp
     sample_robustness.cpp
     sample_shapes.cpp
     sample_stacking.cpp
@@ -194,14 +222,16 @@ endif()
 
 # Include root is the samples dir so "gfx/..." and "host/..." prefixes resolve.
 # The data dir is on the path too so samples can #include recorded dumps
-# (sample_issues pulls dumps/.../box3d_dump.inl at compile time).
+# (sample_issues pulls dumps/.../box3d_dump.inl at compile time). src is on the
+# path so sample_tree.cpp can reach dynamic_tree.h for the node layout helpers.
 target_include_directories(samples PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../data")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../data"
+    "${CMAKE_SOURCE_DIR}/src")
 
 # gfx: the renderer + Draw*/adapter. shared: human, utils (Random*), the
 # benchmark/determinism helpers the samples lean on.
-target_link_libraries(samples PRIVATE gfx shared imgui implot sokol nfd)
+target_link_libraries(samples PRIVATE gfx shared imgui implot imguizmo sokol nfd meshoptimizer)
 
 # MSVC auto-links winmm via a #pragma comment in main.cpp. MinGW ignores that
 # pragma, so link the timeBeginPeriod/timeEndPeriod library explicitly.
