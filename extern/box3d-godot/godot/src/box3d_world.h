@@ -12,8 +12,12 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
+#include <set>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace godot {
@@ -26,6 +30,19 @@ class MultiMeshInstance3D;
 // bodies in, steps Box3D, then reads dynamic bodies out.
 class Box3DWorld : public Node3D {
 	GDCLASS(Box3DWorld, Node3D)
+
+public:
+	// Friction / restitution mixing rules (b3World_SetFrictionCallback /
+	// b3World_SetRestitutionCallback). MIX_DEFAULT keeps the engine's rule:
+	// sqrt(a*b) for friction, max(a, b) for restitution.
+	enum MixRule {
+		MIX_DEFAULT,
+		MIX_AVERAGE,
+		MIX_MIN,
+		MIX_MAX,
+		MIX_MULTIPLY,
+		MIX_GEOMETRIC,
+	};
 
 private:
 	b3WorldId world_id = b3_nullWorldId;
@@ -80,6 +97,31 @@ private:
 	double contact_recycle_distance = -1.0;
 	b3Recording *recording = nullptr;
 
+	// Extended core access III state (cached, applied at world creation).
+	int restitution_iterations = 2; // b3DefaultWorldDef
+	bool enable_restitution_propagation = false; // b3DefaultWorldDef
+	double isotropic_inertia_tolerance = 0.2; // b3DefaultWorldDef
+	bool enable_sse2_fallback = false;
+	int friction_mix = MIX_DEFAULT;
+	int restitution_mix = MIX_DEFAULT;
+
+	// Data-driven solver callbacks. These tables are READ from Box3D worker
+	// threads during b3World_Step and only WRITTEN on the main thread after
+	// join_async_step(), so no step ever overlaps a mutation (no lock needed).
+	struct OneWayRule {
+		b3Vec3 normal;
+		float min_dot;
+	};
+	std::set<std::pair<const Box3DBody *, const Box3DBody *>> filter_body_pairs;
+	std::vector<std::pair<uint64_t, uint64_t>> filter_layer_pairs;
+	std::unordered_map<const Box3DBody *, OneWayRule> one_way_rules;
+	// Instance ids of every body referenced above; validated on the main
+	// thread before each step so a freed body never leaves a stale pointer.
+	std::unordered_map<const Box3DBody *, uint64_t> filter_tracked;
+	void track_filter_body(const Box3DBody *p_body);
+	void purge_stale_filter_bodies();
+	void apply_mix_callbacks();
+
 	bool async_step = false;
 	std::thread step_thread;
 	mutable std::mutex step_mutex;
@@ -94,6 +136,7 @@ private:
 	void ensure_world();
 	void dispatch_contact_events();
 	void dispatch_sensor_events();
+	void dispatch_joint_events();
 	void update_debug_draw();
 	void apply_contact_tuning();
 	void async_thread_main();
@@ -195,6 +238,75 @@ public:
 	PackedByteArray stop_recording();
 	bool is_recording() const;
 	static bool validate_replay(const PackedByteArray &p_data, int p_worker_count = 1);
+
+	// --- Extended core access III: full b3World_* coverage ---------------------
+	static int get_world_count();
+	static int get_max_world_count();
+
+	// Live engine reads (the matching property getters return cached values and
+	// never join an async step; these join and ask Box3D directly).
+	Vector3 get_live_gravity() const;
+	bool is_sleeping_enabled() const;
+	bool is_continuous_enabled() const;
+	bool is_warm_starting_enabled() const;
+	double get_maximum_linear_speed() const; // effective value (engine default when 0)
+	int get_live_worker_count() const;
+	Dictionary get_max_capacity() const;
+	Object *get_user_data() const; // b3World_GetUserData: the owning Box3DWorld
+
+	void set_restitution_iterations(int p_iterations);
+	int get_restitution_iterations() const;
+	void set_enable_restitution_propagation(bool p_enabled);
+	bool get_enable_restitution_propagation() const;
+	void set_isotropic_inertia_tolerance(double p_tolerance);
+	double get_isotropic_inertia_tolerance() const;
+	void set_enable_sse2_fallback(bool p_enabled);
+	bool get_enable_sse2_fallback() const;
+	void set_friction_mix(int p_rule);
+	int get_friction_mix() const;
+	void set_restitution_mix(int p_rule);
+	int get_restitution_mix() const;
+
+	void dump_memory_stats();
+
+	// General shape queries. `shape` is a Dictionary descriptor:
+	//   { type = "sphere",  radius }
+	//   { type = "capsule", radius, height }        (Y axis, total height)
+	//   { type = "box",     size: Vector3 [, radius] }   (full extents)
+	//   { type = "points",  points: PackedVector3Array [, radius] } (convex)
+	// `transform` places the shape in world space.
+	Array overlap_shape(const Dictionary &p_shape, const Transform3D &p_transform, uint32_t p_mask = 0xFFFFFFFFu);
+	Dictionary cast_shape(const Dictionary &p_shape, const Transform3D &p_transform, const Vector3 &p_motion, uint32_t p_mask = 0xFFFFFFFFu);
+	// Static-only variants (b3World_*_Static): only static bodies are tested
+	// and, by upstream design, these may run while an async step is in flight,
+	// so they deliberately do NOT join the async step.
+	Dictionary cast_ray_static(const Vector3 &p_from, const Vector3 &p_to, uint32_t p_mask = 0xFFFFFFFFu);
+	Array overlap_aabb_static(const AABB &p_aabb, uint32_t p_mask = 0xFFFFFFFFu);
+	Array overlap_shape_static(const Dictionary &p_shape, const Transform3D &p_transform, uint32_t p_mask = 0xFFFFFFFFu);
+	Dictionary cast_shape_static(const Dictionary &p_shape, const Transform3D &p_transform, const Vector3 &p_motion, uint32_t p_mask = 0xFFFFFFFFu);
+	// Capsule mover sweep (b3World_CastMover). Capsule is Y-aligned, centered on
+	// `from`; returns the fraction [0, 1] of `motion` that can be travelled.
+	double cast_mover(const Vector3 &p_from, const Vector3 &p_motion, double p_radius, double p_height, uint32_t p_mask = 0xFFFFFFFFu, const Array &p_exclude = Array());
+
+	// Events.
+	Array get_body_move_events();
+
+	// Debug draw (b3World_Draw) collected into plain data.
+	Dictionary get_debug_draw_data(const Dictionary &p_options = Dictionary(), int64_t p_mask = -1);
+
+	// Data-driven custom filter / pre-solve rules (thread-safe; see .cpp).
+	void set_body_pair_collision_enabled(Box3DBody *p_a, Box3DBody *p_b, bool p_enabled);
+	bool is_body_pair_collision_enabled(Box3DBody *p_a, Box3DBody *p_b) const;
+	void set_layer_pair_collision_enabled(int64_t p_layers_a, int64_t p_layers_b, bool p_enabled);
+	void clear_collision_filters();
+	void set_one_way_platform(Box3DBody *p_body, const Vector3 &p_normal = Vector3(0, 1, 0), double p_min_dot = 0.5);
+	void clear_one_way_platform(Box3DBody *p_body);
+
+	// Internal: called from Box3D worker threads. Never touch Godot here.
+	bool filter_allows_pair(b3ShapeId p_a, b3ShapeId p_b) const;
+	bool presolve_allows(b3ShapeId p_a, b3ShapeId p_b, b3Vec3 p_normal) const;
 };
 
 } // namespace godot
+
+VARIANT_ENUM_CAST(godot::Box3DWorld::MixRule);
