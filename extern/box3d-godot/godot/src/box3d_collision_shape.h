@@ -4,6 +4,7 @@
 #pragma once
 
 #include <godot_cpp/classes/node3d.hpp>
+#include <godot_cpp/variant/string.hpp>
 
 namespace godot {
 
@@ -34,6 +35,7 @@ private:
 	double density = 1.0;
 	double friction = 0.6;
 	double restitution = 0.0;
+	String shape_name; // b3ShapeDef.name (debug/recording label)
 
 	void notify_parent();
 
@@ -60,6 +62,10 @@ public:
 	double get_friction() const;
 	void set_restitution(double p_restitution);
 	double get_restitution() const;
+
+	// --- Extended core access III: per-shape name ---
+	void set_shape_name(const String &p_name);
+	String get_shape_name() const;
 };
 
 } // namespace godot

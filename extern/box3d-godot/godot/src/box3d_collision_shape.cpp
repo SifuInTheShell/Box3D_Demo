@@ -103,6 +103,17 @@ double Box3DCollisionShape::get_restitution() const {
 	return restitution;
 }
 
+// --- Extended core access III: per-shape name ---
+
+void Box3DCollisionShape::set_shape_name(const String &p_name) {
+	shape_name = p_name;
+	notify_parent();
+}
+
+String Box3DCollisionShape::get_shape_name() const {
+	return shape_name;
+}
+
 void Box3DCollisionShape::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_shape_type", "type"), &Box3DCollisionShape::set_shape_type);
 	ClassDB::bind_method(D_METHOD("get_shape_type"), &Box3DCollisionShape::get_shape_type);
@@ -123,6 +134,10 @@ void Box3DCollisionShape::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_restitution", "restitution"), &Box3DCollisionShape::set_restitution);
 	ClassDB::bind_method(D_METHOD("get_restitution"), &Box3DCollisionShape::get_restitution);
 
+	// --- Extended core access III: per-shape name ---
+	ClassDB::bind_method(D_METHOD("set_shape_name", "name"), &Box3DCollisionShape::set_shape_name);
+	ClassDB::bind_method(D_METHOD("get_shape_name"), &Box3DCollisionShape::get_shape_name);
+
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "shape_type", PROPERTY_HINT_ENUM, "Box,Sphere,Capsule,Cylinder,Cone"), "set_shape_type", "get_shape_type");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "box_size"), "set_box_size", "get_box_size");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sphere_radius", PROPERTY_HINT_RANGE, "0.01,100,0.01,or_greater"), "set_sphere_radius", "get_sphere_radius");
@@ -132,6 +147,7 @@ void Box3DCollisionShape::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "density", PROPERTY_HINT_RANGE, "0.01,100,0.01,or_greater"), "set_density", "get_density");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "friction", PROPERTY_HINT_RANGE, "0,1,0.01,or_greater"), "set_friction", "get_friction");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "restitution", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_restitution", "get_restitution");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "shape_name"), "set_shape_name", "get_shape_name");
 
 	BIND_ENUM_CONSTANT(BOX);
 	BIND_ENUM_CONSTANT(SPHERE);

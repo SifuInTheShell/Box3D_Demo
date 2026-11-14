@@ -25,10 +25,28 @@ using namespace godot;
 Box3DBody::Box3DBody() {}
 
 Box3DBody::~Box3DBody() {
+	free_owned_geometry();
+}
+
+// Releases every geometry blob Box3D shapes reference by pointer. Only safe
+// once those shapes are gone (destroy_body / destructor).
+void Box3DBody::free_owned_geometry() {
 	if (mesh_data != nullptr) {
 		b3DestroyMesh(mesh_data);
 		mesh_data = nullptr;
 	}
+	if (height_field_data != nullptr) {
+		b3DestroyHeightField(height_field_data);
+		height_field_data = nullptr;
+	}
+	if (compound_data != nullptr) {
+		b3DestroyCompound(compound_data);
+		compound_data = nullptr;
+	}
+	for (b3MeshData *m : extra_mesh_data) {
+		b3DestroyMesh(m);
+	}
+	extra_mesh_data.clear();
 }
 
 Box3DWorld *Box3DBody::find_world() {
@@ -90,6 +108,11 @@ void Box3DBody::create_in_world() {
 	body_def.motionLocks.angularX = lock_angular_x;
 	body_def.motionLocks.angularY = lock_angular_y;
 	body_def.motionLocks.angularZ = lock_angular_z;
+	body_def.enableSleep = sleep_enabled;
+	body_def.safetyFactor = (float)safety_factor;
+	// Box3D copies the name into its own name cache.
+	CharString body_name_utf8 = body_name.utf8();
+	body_def.name = body_name.is_empty() ? nullptr : body_name_utf8.get_data();
 	body_def.userData = this;
 	body_id = b3CreateBody(world_id, &body_def);
 	snap_prev = b3Body_GetTransform(body_id);
@@ -102,11 +125,16 @@ void Box3DBody::create_in_world() {
 	{
 		Transform3D body_inv = get_global_transform().affine_inverse();
 		bool has_child_shapes = false;
+		// bake_compound: one baked b3CompoundData shape for all children
+		// (static, non-sensor bodies only); falls back to runtime shapes.
+		bool baked = bake_compound && create_baked_compound(body_inv);
 		for (int i = 0; i < get_child_count(); ++i) {
 			Box3DCollisionShape *cs = Object::cast_to<Box3DCollisionShape>(get_child(i));
 			if (cs != nullptr) {
 				has_child_shapes = true;
-				create_child_shape(cs, body_inv);
+				if (!baked) {
+					create_child_shape(cs, body_inv);
+				}
 			}
 		}
 		if (has_child_shapes) {
@@ -271,6 +299,9 @@ void Box3DBody::create_in_world() {
 				UtilityFunctions::push_warning("Box3DBody shape_type is Fit Mesh but no child MeshInstance3D was found.");
 			}
 		} break;
+		case HEIGHTFIELD: {
+			create_height_field_shape(shape_def);
+		} break;
 		case BOX:
 		default: {
 			b3BoxHull box = b3MakeBoxHull((float)(box_size.x * 0.5), (float)(box_size.y * 0.5), (float)(box_size.z * 0.5));
@@ -407,6 +438,8 @@ void Box3DBody::create_child_shape(Box3DCollisionShape *p_shape, const Transform
 	sd.isSensor = is_sensor;
 	sd.enableSensorEvents = true;
 	sd.enableHitEvents = true;
+	CharString shape_name_utf8 = p_shape->get_shape_name().utf8();
+	sd.name = p_shape->get_shape_name().is_empty() ? nullptr : shape_name_utf8.get_data();
 
 	// The shape's transform relative to the body.
 	Transform3D local = p_body_inv * p_shape->get_global_transform();
@@ -476,12 +509,9 @@ void Box3DBody::destroy_body() {
 		b3DestroyBody(body_id);
 	}
 	body_id = b3_nullBodyId;
-	// The shape (and its mesh reference) is gone now, so the mesh data is free
-	// to release.
-	if (mesh_data != nullptr) {
-		b3DestroyMesh(mesh_data);
-		mesh_data = nullptr;
-	}
+	// The shapes (and their mesh / height-field / compound references) are
+	// gone now, so the geometry is free to release.
+	free_owned_geometry();
 }
 
 void Box3DBody::rebuild_if_alive() {
@@ -663,7 +693,18 @@ void Box3DBody::teleport(const Transform3D &p_xform) {
 
 void Box3DBody::set_body_type(int p_type) {
 	body_type = (BodyType)p_type;
-	rebuild_if_alive();
+	// Static-only geometry (height field, baked compound, triangle mesh) is
+	// rebuilt so creation re-validates/warns; everything else switches live.
+	if (shape_type == HEIGHTFIELD || shape_type == MESH || compound_data != nullptr) {
+		rebuild_if_alive();
+		return;
+	}
+	if (body_live()) {
+		b3Body_SetType(body_id, (b3BodyType)body_type);
+		debug_mass = b3Body_GetMass(body_id);
+		snap_awake = b3Body_IsAwake(body_id);
+		asleep_synced = false;
+	}
 }
 
 int Box3DBody::get_body_type() const {
@@ -768,24 +809,37 @@ void Box3DBody::set_linear_damping(double p_damping) {
 }
 
 double Box3DBody::get_linear_damping() const {
+	if (body_live()) {
+		return b3Body_GetLinearDamping(body_id);
+	}
 	return linear_damping;
 }
 
 void Box3DBody::set_angular_damping(double p_damping) {
 	angular_damping = p_damping;
-	rebuild_if_alive();
+	if (body_live()) {
+		b3Body_SetAngularDamping(body_id, (float)angular_damping);
+	}
 }
 
 double Box3DBody::get_angular_damping() const {
+	if (body_live()) {
+		return b3Body_GetAngularDamping(body_id);
+	}
 	return angular_damping;
 }
 
 void Box3DBody::set_gravity_scale(double p_scale) {
 	gravity_scale = p_scale;
-	rebuild_if_alive();
+	if (body_live()) {
+		b3Body_SetGravityScale(body_id, (float)gravity_scale);
+	}
 }
 
 double Box3DBody::get_gravity_scale() const {
+	if (body_live()) {
+		return b3Body_GetGravityScale(body_id);
+	}
 	return gravity_scale;
 }
 
@@ -945,7 +999,9 @@ bool Box3DBody::get_sync_node_transform() const {
 
 void Box3DBody::set_allow_fast_rotation(bool p_enabled) {
 	allow_fast_rotation = p_enabled;
-	rebuild_if_alive();
+	if (body_live()) {
+		b3Body_AllowFastRotation(body_id, p_enabled);
+	}
 }
 
 bool Box3DBody::get_allow_fast_rotation() const {
@@ -1157,6 +1213,7 @@ Array Box3DBody::get_contact_data() const {
 			const b3ManifoldPoint &mp = manifold.points[best];
 			Dictionary d;
 			d["body"] = other;
+			d["contact_id"] = Vector3i(c.contactId.index1, (int32_t)c.contactId.world0, (int32_t)c.contactId.generation);
 			d["point"] = my_center + to_gd(self_is_a ? mp.anchorA : mp.anchorB);
 			// Manifold normal points A -> B; flip so it points away from us.
 			d["normal"] = self_is_a ? to_gd(manifold.normal) : -to_gd(manifold.normal);
@@ -1467,6 +1524,1145 @@ Dictionary Box3DBody::shape_raycast(const Vector3 &p_from, const Vector3 &p_to, 
 	return d;
 }
 
+// --- Extended core access III: full body/shape/contact API --------------------
+
+namespace {
+
+Vector3i contact_id_to_gd(b3ContactId p_id) {
+	return Vector3i(p_id.index1, (int32_t)p_id.world0, (int32_t)p_id.generation);
+}
+
+b3ContactId contact_id_to_b3(const Vector3i &p_id) {
+	b3ContactId id = b3_nullContactId;
+	id.index1 = p_id.x;
+	id.world0 = (uint16_t)p_id.y;
+	id.generation = (uint32_t)p_id.z;
+	return id;
+}
+
+Basis matrix_to_basis(const b3Matrix3 &p_m) {
+	// b3Matrix3 is column-major (cx, cy, cz); Basis(x, y, z) takes columns.
+	return Basis(to_gd(p_m.cx), to_gd(p_m.cy), to_gd(p_m.cz));
+}
+
+Dictionary material_to_dict(const b3SurfaceMaterial &p_mat) {
+	Dictionary d;
+	d["friction"] = p_mat.friction;
+	d["restitution"] = p_mat.restitution;
+	d["rolling_resistance"] = p_mat.rollingResistance;
+	d["tangent_velocity"] = to_gd(p_mat.tangentVelocity);
+	d["user_material_id"] = (int64_t)p_mat.userMaterialId;
+	d["custom_color"] = (int64_t)p_mat.customColor;
+	return d;
+}
+
+// Missing keys keep the value already in r_mat.
+void dict_to_material(const Dictionary &p_dict, b3SurfaceMaterial &r_mat) {
+	r_mat.friction = (float)(double)p_dict.get("friction", (double)r_mat.friction);
+	r_mat.restitution = (float)(double)p_dict.get("restitution", (double)r_mat.restitution);
+	r_mat.rollingResistance = (float)(double)p_dict.get("rolling_resistance", (double)r_mat.rollingResistance);
+	r_mat.tangentVelocity = to_b3((Vector3)p_dict.get("tangent_velocity", to_gd(r_mat.tangentVelocity)));
+	r_mat.userMaterialId = (uint64_t)(int64_t)p_dict.get("user_material_id", (int64_t)r_mat.userMaterialId);
+	r_mat.customColor = (uint32_t)(int64_t)p_dict.get("custom_color", (int64_t)r_mat.customColor);
+}
+
+b3QueryFilter make_query_filter(int p_mask) {
+	b3QueryFilter filter = b3DefaultQueryFilter();
+	// -1 (all bits) from GDScript maps to every category.
+	filter.maskBits = p_mask == -1 ? UINT64_MAX : (uint64_t)(uint32_t)p_mask;
+	return filter;
+}
+
+// Capsule from { center1, center2, radius } or { height, radius } (upright,
+// total height including caps, centred on the origin).
+b3Capsule dict_to_capsule(const Dictionary &p_dict) {
+	b3Capsule capsule;
+	float radius = (float)(double)p_dict.get("radius", 0.5);
+	capsule.radius = radius;
+	if (p_dict.has("center1") || p_dict.has("center2")) {
+		capsule.center1 = to_b3((Vector3)p_dict.get("center1", Vector3()));
+		capsule.center2 = to_b3((Vector3)p_dict.get("center2", Vector3()));
+	} else {
+		float half = (float)(double)p_dict.get("height", 2.0) * 0.5f - radius;
+		if (half < 0.0f) {
+			half = 0.0f;
+		}
+		capsule.center1 = b3Vec3{ 0.0f, -half, 0.0f };
+		capsule.center2 = b3Vec3{ 0.0f, half, 0.0f };
+	}
+	return capsule;
+}
+
+// Fills r_points/r_radius with a convex proxy described by p_dict (see the
+// header for the accepted forms). Points are relative to the query origin.
+void dict_to_proxy_points(const Dictionary &p_dict, std::vector<b3Vec3> &r_points, float &r_radius) {
+	r_points.clear();
+	r_radius = (float)(double)p_dict.get("radius", 0.0);
+	if (p_dict.has("points")) {
+		PackedVector3Array pts = p_dict["points"];
+		for (int i = 0; i < pts.size() && i < B3_MAX_SHAPE_CAST_POINTS; ++i) {
+			r_points.push_back(to_b3(pts[i]));
+		}
+	} else if (p_dict.has("half_extents")) {
+		Vector3 h = p_dict["half_extents"];
+		Quaternion q = p_dict.get("rotation", Quaternion());
+		for (int c = 0; c < 8; ++c) {
+			Vector3 corner((c & 1) ? h.x : -h.x, (c & 2) ? h.y : -h.y, (c & 4) ? h.z : -h.z);
+			r_points.push_back(to_b3(q.xform(corner)));
+		}
+	} else if (p_dict.has("center1") || p_dict.has("center2") || p_dict.has("height")) {
+		b3Capsule capsule = dict_to_capsule(p_dict);
+		r_points.push_back(capsule.center1);
+		r_points.push_back(capsule.center2);
+		r_radius = capsule.radius;
+	}
+	if (r_points.empty()) {
+		r_points.push_back(b3Vec3{ 0.0f, 0.0f, 0.0f }); // sphere / point
+	}
+}
+
+AABB aabb_to_gd(const b3AABB &p_box) {
+	Vector3 lower = to_gd(p_box.lowerBound);
+	Vector3 upper = to_gd(p_box.upperBound);
+	return AABB(lower, upper - lower);
+}
+
+Dictionary hull_to_dict(const b3HullData *p_hull) {
+	Dictionary d;
+	if (p_hull == nullptr) {
+		return d;
+	}
+	PackedVector3Array points;
+	const b3Vec3 *src = b3GetHullPoints(p_hull);
+	for (int i = 0; src != nullptr && i < p_hull->vertexCount; ++i) {
+		points.push_back(to_gd(src[i]));
+	}
+	// Faces as vertex-index loops, walked through the half-edge structure.
+	Array faces;
+	const b3HullFace *hull_faces = b3GetHullFaces(p_hull);
+	const b3HullHalfEdge *edges = b3GetHullEdges(p_hull);
+	for (int f = 0; hull_faces != nullptr && edges != nullptr && f < p_hull->faceCount; ++f) {
+		PackedInt32Array loop;
+		int first = hull_faces[f].edge;
+		int e = first;
+		int guard = 0;
+		do {
+			loop.push_back(edges[e].origin);
+			e = edges[e].next;
+		} while (e != first && ++guard <= p_hull->edgeCount);
+		faces.push_back(loop);
+	}
+	d["points"] = points;
+	d["faces"] = faces;
+	d["center"] = to_gd(p_hull->center);
+	d["volume"] = p_hull->volume;
+	d["surface_area"] = p_hull->surfaceArea;
+	d["inner_radius"] = p_hull->innerRadius;
+	d["aabb"] = aabb_to_gd(p_hull->aabb);
+	d["vertex_count"] = p_hull->vertexCount;
+	d["edge_count"] = p_hull->edgeCount;
+	d["face_count"] = p_hull->faceCount;
+	return d;
+}
+
+} // namespace
+
+b3ShapeId Box3DBody::shape_at(int p_index) const {
+	std::vector<b3ShapeId> ids = shape_ids();
+	if (p_index < 0 || p_index >= (int)ids.size()) {
+		return b3_nullShapeId;
+	}
+	return ids[p_index];
+}
+
+int Box3DBody::shape_index_of(b3ShapeId p_shape) const {
+	std::vector<b3ShapeId> ids = shape_ids();
+	for (int i = 0; i < (int)ids.size(); ++i) {
+		if (B3_ID_EQUALS(ids[i], p_shape)) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+// Full contact description: { contact_id, body_a, body_b, shape_index_a,
+// shape_index_b (index on that body, -1 if unknown), manifolds: [ { normal
+// (A -> B), points: [ { point (world), separation, normal_impulse,
+// total_normal_impulse, normal_velocity, triangle_index, persisted } ] } ] }.
+Dictionary Box3DBody::contact_to_dict(const b3ContactData &p_contact) const {
+	Dictionary d;
+	d["contact_id"] = contact_id_to_gd(p_contact.contactId);
+	Box3DBody *body_a = world != nullptr ? world->body_from_shape(p_contact.shapeIdA) : nullptr;
+	Box3DBody *body_b = world != nullptr ? world->body_from_shape(p_contact.shapeIdB) : nullptr;
+	d["body_a"] = body_a;
+	d["body_b"] = body_b;
+	d["shape_index_a"] = body_a != nullptr ? body_a->shape_index_of(p_contact.shapeIdA) : -1;
+	d["shape_index_b"] = body_b != nullptr ? body_b->shape_index_of(p_contact.shapeIdB) : -1;
+	Vector3 center_a;
+	Vector3 center_b;
+	if (b3Shape_IsValid(p_contact.shapeIdA)) {
+		center_a = to_gd_pos(b3Body_GetWorldCenter(b3Shape_GetBody(p_contact.shapeIdA)));
+	}
+	if (b3Shape_IsValid(p_contact.shapeIdB)) {
+		center_b = to_gd_pos(b3Body_GetWorldCenter(b3Shape_GetBody(p_contact.shapeIdB)));
+	}
+	Array manifolds;
+	for (int m = 0; p_contact.manifolds != nullptr && m < p_contact.manifoldCount; ++m) {
+		const b3Manifold &manifold = p_contact.manifolds[m];
+		Dictionary md;
+		md["normal"] = to_gd(manifold.normal);
+		md["twist_impulse"] = manifold.twistImpulse;
+		md["friction_impulse"] = to_gd(manifold.frictionImpulse);
+		md["rolling_impulse"] = to_gd(manifold.rollingImpulse);
+		Array points;
+		for (int k = 0; k < manifold.pointCount; ++k) {
+			const b3ManifoldPoint &mp = manifold.points[k];
+			Dictionary pd;
+			pd["point"] = center_a + to_gd(mp.anchorA);
+			pd["point_b"] = center_b + to_gd(mp.anchorB);
+			pd["separation"] = mp.separation;
+			pd["normal_impulse"] = mp.normalImpulse;
+			pd["total_normal_impulse"] = mp.totalNormalImpulse;
+			pd["normal_velocity"] = mp.normalVelocity;
+			pd["triangle_index"] = mp.triangleIndex;
+			pd["persisted"] = mp.persisted;
+			points.push_back(pd);
+		}
+		md["points"] = points;
+		manifolds.push_back(md);
+	}
+	d["manifolds"] = manifolds;
+	return d;
+}
+
+// Persistent properties --------------------------------------------------------
+
+void Box3DBody::set_sleep_enabled(bool p_enabled) {
+	sleep_enabled = p_enabled;
+	if (body_live()) {
+		b3Body_EnableSleep(body_id, p_enabled);
+	}
+}
+
+bool Box3DBody::is_sleep_enabled() const {
+	if (body_live()) {
+		return b3Body_IsSleepEnabled(body_id);
+	}
+	return sleep_enabled;
+}
+
+void Box3DBody::set_safety_factor(double p_factor) {
+	safety_factor = p_factor;
+	if (body_live()) {
+		b3Body_SetSafetyFactor(body_id, (float)p_factor);
+	}
+}
+
+double Box3DBody::get_safety_factor() const {
+	if (body_live()) {
+		return b3Body_GetSafetyFactor(body_id);
+	}
+	return safety_factor;
+}
+
+void Box3DBody::set_body_name(const String &p_name) {
+	body_name = p_name;
+	if (body_live()) {
+		CharString utf8 = p_name.utf8();
+		b3Body_SetName(body_id, p_name.is_empty() ? nullptr : utf8.get_data());
+	}
+}
+
+String Box3DBody::get_body_name() const {
+	if (body_live()) {
+		const char *name = b3Body_GetName(body_id);
+		return name != nullptr ? String::utf8(name) : String();
+	}
+	return body_name;
+}
+
+void Box3DBody::set_bake_compound(bool p_enabled) {
+	bake_compound = p_enabled;
+	rebuild_if_alive();
+}
+
+bool Box3DBody::get_bake_compound() const {
+	return bake_compound;
+}
+
+void Box3DBody::set_heightfield_heights(const PackedFloat32Array &p_heights) {
+	heightfield_heights = p_heights;
+	if (shape_type == HEIGHTFIELD) {
+		rebuild_if_alive();
+	}
+}
+
+PackedFloat32Array Box3DBody::get_heightfield_heights() const {
+	return heightfield_heights;
+}
+
+void Box3DBody::set_heightfield_count_x(int p_count) {
+	heightfield_count_x = p_count < 0 ? 0 : p_count;
+	if (shape_type == HEIGHTFIELD) {
+		rebuild_if_alive();
+	}
+}
+
+int Box3DBody::get_heightfield_count_x() const {
+	return heightfield_count_x;
+}
+
+void Box3DBody::set_heightfield_count_z(int p_count) {
+	heightfield_count_z = p_count < 0 ? 0 : p_count;
+	if (shape_type == HEIGHTFIELD) {
+		rebuild_if_alive();
+	}
+}
+
+int Box3DBody::get_heightfield_count_z() const {
+	return heightfield_count_z;
+}
+
+void Box3DBody::set_heightfield_scale(const Vector3 &p_scale) {
+	heightfield_scale = p_scale;
+	if (shape_type == HEIGHTFIELD) {
+		rebuild_if_alive();
+	}
+}
+
+Vector3 Box3DBody::get_heightfield_scale() const {
+	return heightfield_scale;
+}
+
+void Box3DBody::set_heightfield_materials(const PackedByteArray &p_materials) {
+	heightfield_materials = p_materials;
+	if (shape_type == HEIGHTFIELD) {
+		rebuild_if_alive();
+	}
+}
+
+PackedByteArray Box3DBody::get_heightfield_materials() const {
+	return heightfield_materials;
+}
+
+void Box3DBody::create_height_field_shape(const b3ShapeDef &p_def) {
+	if (height_field_data != nullptr) {
+		b3DestroyHeightField(height_field_data);
+		height_field_data = nullptr;
+	}
+	const int cx = heightfield_count_x;
+	const int cz = heightfield_count_z;
+	if (cx < 2 || cz < 2 || heightfield_heights.size() != cx * cz) {
+		UtilityFunctions::push_warning("Box3DBody: Height Field needs heightfield_count_x/z >= 2 and exactly count_x * count_z heightfield_heights.");
+		return;
+	}
+	if (heightfield_scale.x <= 0.0 || heightfield_scale.y <= 0.0 || heightfield_scale.z <= 0.0) {
+		UtilityFunctions::push_warning("Box3DBody: heightfield_scale components must be positive.");
+		return;
+	}
+	if (body_type != STATIC) {
+		UtilityFunctions::push_warning("Box3DBody: Height Field colliders are only supported on static bodies.");
+	}
+	std::vector<float> heights((size_t)(cx * cz));
+	float min_h = heightfield_heights[0];
+	float max_h = heightfield_heights[0];
+	for (int i = 0; i < cx * cz; ++i) {
+		float h = heightfield_heights[i];
+		heights[(size_t)i] = h;
+		min_h = MIN(min_h, h);
+		max_h = MAX(max_h, h);
+	}
+	const int cell_count = (cx - 1) * (cz - 1);
+	std::vector<uint8_t> materials;
+	if (heightfield_materials.size() == cell_count) {
+		materials.resize((size_t)cell_count);
+		for (int i = 0; i < cell_count; ++i) {
+			materials[(size_t)i] = heightfield_materials[i];
+		}
+	} else if (heightfield_materials.size() != 0) {
+		UtilityFunctions::push_warning("Box3DBody: heightfield_materials must hold (count_x - 1) * (count_z - 1) entries; ignored.");
+	}
+	b3HeightFieldDef def = {};
+	def.heights = heights.data();
+	def.materialIndices = materials.empty() ? nullptr : materials.data();
+	def.scale = to_b3(heightfield_scale);
+	def.countX = cx;
+	def.countZ = cz;
+	def.globalMinimumHeight = min_h;
+	def.globalMaximumHeight = max_h;
+	def.clockwiseWinding = false;
+	// Box3D references (does not copy) the height field: kept until
+	// destroy_body().
+	height_field_data = b3CreateHeightField(&def);
+	if (height_field_data != nullptr) {
+		b3CreateHeightFieldShape(body_id, &p_def, height_field_data);
+	}
+}
+
+bool Box3DBody::create_baked_compound(const Transform3D &p_body_inv) {
+	if (body_type != STATIC || is_sensor) {
+		UtilityFunctions::push_warning("Box3DBody: bake_compound requires a static, non-sensor body; using runtime shapes.");
+		return false;
+	}
+	std::vector<Box3DCollisionShape *> children;
+	for (int i = 0; i < get_child_count(); ++i) {
+		Box3DCollisionShape *cs = Object::cast_to<Box3DCollisionShape>(get_child(i));
+		if (cs != nullptr) {
+			children.push_back(cs);
+		}
+	}
+	if (children.empty()) {
+		return false;
+	}
+	std::vector<b3CompoundSphereDef> spheres;
+	std::vector<b3CompoundCapsuleDef> capsules;
+	std::vector<b3CompoundHullDef> hulls;
+	// Box hulls live in this vector (reserved up front so the pointers the
+	// hull defs take stay valid); cylinder/cone hulls are heap blobs freed
+	// once b3CreateCompound has cloned them.
+	std::vector<b3BoxHull> boxes;
+	boxes.reserve(children.size());
+	std::vector<b3HullData *> owned_hulls;
+	for (Box3DCollisionShape *cs : children) {
+		b3SurfaceMaterial mat = b3DefaultSurfaceMaterial();
+		mat.friction = (float)cs->get_friction();
+		mat.restitution = (float)cs->get_restitution();
+		Transform3D local = p_body_inv * cs->get_global_transform();
+		switch (cs->get_shape_type()) {
+			case Box3DCollisionShape::SPHERE: {
+				b3CompoundSphereDef sd;
+				sd.sphere.center = to_b3(local.origin);
+				sd.sphere.radius = (float)cs->get_sphere_radius();
+				sd.material = mat;
+				spheres.push_back(sd);
+			} break;
+			case Box3DCollisionShape::CAPSULE: {
+				float radius = (float)cs->get_capsule_radius();
+				float half = (float)(cs->get_capsule_height() * 0.5) - radius;
+				if (half < 0.0f) {
+					half = 0.0f;
+				}
+				b3CompoundCapsuleDef cd;
+				cd.capsule.center1 = to_b3(local.xform(Vector3(0, -half, 0)));
+				cd.capsule.center2 = to_b3(local.xform(Vector3(0, half, 0)));
+				cd.capsule.radius = radius;
+				cd.material = mat;
+				capsules.push_back(cd);
+			} break;
+			case Box3DCollisionShape::CYLINDER:
+			case Box3DCollisionShape::CONE: {
+				float h = (float)cs->get_capsule_height();
+				float r = (float)cs->get_capsule_radius();
+				bool cone = cs->get_shape_type() == Box3DCollisionShape::CONE;
+				b3HullData *hull = cone ? b3CreateCone(h, r, 0.0f, cs->get_sides())
+										: b3CreateCylinder(h, r, -h * 0.5f, cs->get_sides());
+				if (hull == nullptr) {
+					break;
+				}
+				owned_hulls.push_back(hull);
+				b3CompoundHullDef hd;
+				hd.hull = hull;
+				hd.transform.p = to_b3(cone ? local.xform(Vector3(0, -h * 0.5f, 0)) : local.origin);
+				hd.transform.q = to_b3(local.basis.get_rotation_quaternion());
+				hd.material = mat;
+				hulls.push_back(hd);
+			} break;
+			case Box3DCollisionShape::BOX:
+			default: {
+				Vector3 half = cs->get_box_size() * 0.5;
+				boxes.push_back(b3MakeBoxHull((float)half.x, (float)half.y, (float)half.z));
+				b3CompoundHullDef hd;
+				hd.hull = &boxes.back().base;
+				hd.transform = to_b3_transform(local);
+				hd.material = mat;
+				hulls.push_back(hd);
+			} break;
+		}
+	}
+	b3CompoundDef def = {};
+	def.spheres = spheres.empty() ? nullptr : spheres.data();
+	def.sphereCount = (int)spheres.size();
+	def.capsules = capsules.empty() ? nullptr : capsules.data();
+	def.capsuleCount = (int)capsules.size();
+	def.hulls = hulls.empty() ? nullptr : hulls.data();
+	def.hullCount = (int)hulls.size();
+	if (compound_data != nullptr) {
+		b3DestroyCompound(compound_data);
+	}
+	compound_data = b3CreateCompound(&def);
+	for (b3HullData *hull : owned_hulls) {
+		b3DestroyHull(hull);
+	}
+	if (compound_data == nullptr) {
+		return false;
+	}
+	b3ShapeDef sd = b3DefaultShapeDef();
+	sd.enableContactEvents = contact_monitor;
+	sd.filter.categoryBits = collision_layer;
+	sd.filter.maskBits = collision_mask;
+	sd.enableSensorEvents = true;
+	sd.enableHitEvents = true;
+	b3ShapeId shape = b3CreateBakedCompoundShape(body_id, &sd, compound_data);
+	if (B3_IS_NULL(shape)) {
+		b3DestroyCompound(compound_data);
+		compound_data = nullptr;
+		return false;
+	}
+	return true;
+}
+
+// Live body state ---------------------------------------------------------------
+
+int Box3DBody::get_core_body_type() const {
+	if (!body_live()) {
+		return -1;
+	}
+	return (int)b3Body_GetType(body_id);
+}
+
+bool Box3DBody::is_fast_rotation_allowed() const {
+	if (!body_live()) {
+		return allow_fast_rotation;
+	}
+	return b3Body_IsFastRotationAllowed(body_id);
+}
+
+bool Box3DBody::is_bullet() const {
+	if (!body_live()) {
+		return continuous;
+	}
+	return b3Body_IsBullet(body_id);
+}
+
+bool Box3DBody::is_contact_recycling_enabled() const {
+	if (!body_live()) {
+		return contact_recycling;
+	}
+	return b3Body_IsContactRecyclingEnabled(body_id);
+}
+
+void Box3DBody::enable_hit_events(bool p_enabled) {
+	if (body_live()) {
+		b3Body_EnableHitEvents(body_id, p_enabled);
+	}
+}
+
+Vector3 Box3DBody::get_body_position() const {
+	if (!body_live()) {
+		return get_global_position();
+	}
+	return to_gd_pos(b3Body_GetPosition(body_id));
+}
+
+Quaternion Box3DBody::get_body_rotation() const {
+	if (!body_live()) {
+		return get_global_basis().get_rotation_quaternion();
+	}
+	return to_gd(b3Body_GetRotation(body_id));
+}
+
+Basis Box3DBody::get_local_rotational_inertia() const {
+	if (!body_live()) {
+		return Basis(Vector3(), Vector3(), Vector3());
+	}
+	return matrix_to_basis(b3Body_GetLocalRotationalInertia(body_id));
+}
+
+Basis Box3DBody::get_world_inverse_rotational_inertia() const {
+	if (!body_live()) {
+		return Basis(Vector3(), Vector3(), Vector3());
+	}
+	return matrix_to_basis(b3Body_GetWorldInverseRotationalInertia(body_id));
+}
+
+double Box3DBody::get_min_extent() const {
+	if (!body_live()) {
+		return 0.0;
+	}
+	return b3Body_GetMinExtent(body_id);
+}
+
+Vector3 Box3DBody::get_max_extent() const {
+	if (!body_live()) {
+		return Vector3();
+	}
+	return to_gd(b3Body_GetMaxExtent(body_id));
+}
+
+Vector3 Box3DBody::get_max_extent_origin() const {
+	if (!body_live()) {
+		return Vector3();
+	}
+	return to_gd(b3Body_GetMaxExtentOrigin(body_id));
+}
+
+Dictionary Box3DBody::get_motion_locks() const {
+	Dictionary d;
+	b3MotionLocks locks;
+	if (body_live()) {
+		locks = b3Body_GetMotionLocks(body_id);
+	} else {
+		locks.linearX = lock_linear_x;
+		locks.linearY = lock_linear_y;
+		locks.linearZ = lock_linear_z;
+		locks.angularX = lock_angular_x;
+		locks.angularY = lock_angular_y;
+		locks.angularZ = lock_angular_z;
+	}
+	d["linear_x"] = locks.linearX;
+	d["linear_y"] = locks.linearY;
+	d["linear_z"] = locks.linearZ;
+	d["angular_x"] = locks.angularX;
+	d["angular_y"] = locks.angularY;
+	d["angular_z"] = locks.angularZ;
+	return d;
+}
+
+Object *Box3DBody::get_box3d_world() const {
+	if (world == nullptr || !body_live()) {
+		return nullptr;
+	}
+	b3WorldId id = b3Body_GetWorld(body_id);
+	// Sanity check that the core agrees about which world owns this body.
+	if (b3StoreWorldId(id) != b3StoreWorldId(world->get_world_id())) {
+		return nullptr;
+	}
+	return world;
+}
+
+Array Box3DBody::get_joints() const {
+	Array out;
+	if (!body_live()) {
+		return out;
+	}
+	int count = b3Body_GetJointCount(body_id);
+	if (count <= 0) {
+		return out;
+	}
+	std::vector<b3JointId> joints((size_t)count);
+	int got = b3Body_GetJoints(body_id, joints.data(), count);
+	for (int i = 0; i < got; ++i) {
+		b3JointId j = joints[(size_t)i];
+		if (!b3Joint_IsValid(j)) {
+			continue;
+		}
+		Dictionary d;
+		d["joint_id"] = (int64_t)b3StoreJointId(j);
+		d["type"] = (int)b3Joint_GetType(j);
+		b3BodyId a = b3Joint_GetBodyA(j);
+		b3BodyId b = b3Joint_GetBodyB(j);
+		d["body_a"] = b3Body_IsValid(a) ? static_cast<Box3DBody *>(b3Body_GetUserData(a)) : nullptr;
+		d["body_b"] = b3Body_IsValid(b) ? static_cast<Box3DBody *>(b3Body_GetUserData(b)) : nullptr;
+		out.push_back(d);
+	}
+	return out;
+}
+
+// Single-body queries ----------------------------------------------------------
+
+Dictionary Box3DBody::cast_ray(const Vector3 &p_from, const Vector3 &p_to, int p_mask) const {
+	Dictionary d;
+	d["hit"] = false;
+	if (!body_live()) {
+		return d;
+	}
+	b3BodyCastResult r = b3Body_CastRay(body_id, to_b3_pos(p_from), to_b3(p_to - p_from),
+			make_query_filter(p_mask), 1.0f, b3Body_GetTransform(body_id));
+	if (!r.hit) {
+		return d;
+	}
+	d["hit"] = true;
+	d["position"] = to_gd_pos(r.point);
+	d["normal"] = to_gd(r.normal);
+	d["fraction"] = r.fraction;
+	d["triangle_index"] = r.triangleIndex;
+	d["user_material_id"] = (int64_t)r.userMaterialId;
+	d["shape_index"] = shape_index_of(r.shapeId);
+	return d;
+}
+
+Dictionary Box3DBody::cast_shape(const Vector3 &p_origin, const Dictionary &p_shape, const Vector3 &p_translation,
+		bool p_can_encroach, int p_mask) const {
+	Dictionary d;
+	d["hit"] = false;
+	if (!body_live()) {
+		return d;
+	}
+	std::vector<b3Vec3> points;
+	b3ShapeProxy proxy;
+	dict_to_proxy_points(p_shape, points, proxy.radius);
+	proxy.points = points.data();
+	proxy.count = (int)points.size();
+	b3BodyCastResult r = b3Body_CastShape(body_id, to_b3_pos(p_origin), &proxy, to_b3(p_translation),
+			make_query_filter(p_mask), 1.0f, p_can_encroach, b3Body_GetTransform(body_id));
+	if (!r.hit) {
+		return d;
+	}
+	d["hit"] = true;
+	d["position"] = to_gd_pos(r.point);
+	d["normal"] = to_gd(r.normal);
+	d["fraction"] = r.fraction;
+	d["triangle_index"] = r.triangleIndex;
+	d["user_material_id"] = (int64_t)r.userMaterialId;
+	d["shape_index"] = shape_index_of(r.shapeId);
+	return d;
+}
+
+bool Box3DBody::overlap_shape(const Vector3 &p_origin, const Dictionary &p_shape, int p_mask) const {
+	if (!body_live()) {
+		return false;
+	}
+	std::vector<b3Vec3> points;
+	b3ShapeProxy proxy;
+	dict_to_proxy_points(p_shape, points, proxy.radius);
+	proxy.points = points.data();
+	proxy.count = (int)points.size();
+	return b3Body_OverlapShape(body_id, to_b3_pos(p_origin), &proxy, make_query_filter(p_mask),
+			b3Body_GetTransform(body_id));
+}
+
+Array Box3DBody::collide_mover(const Vector3 &p_origin, const Dictionary &p_capsule, int p_mask) const {
+	Array out;
+	if (!body_live()) {
+		return out;
+	}
+	int capacity = b3Body_GetShapeCount(body_id);
+	if (capacity <= 0) {
+		return out;
+	}
+	b3Capsule mover = dict_to_capsule(p_capsule);
+	std::vector<b3BodyPlaneResult> planes((size_t)capacity);
+	int count = b3Body_CollideMover(body_id, planes.data(), capacity, to_b3_pos(p_origin), &mover,
+			make_query_filter(p_mask), b3Body_GetTransform(body_id));
+	for (int i = 0; i < count; ++i) {
+		const b3PlaneResult &pr = planes[(size_t)i].result;
+		// The core plane is relative to the query origin; shift it to world.
+		Vector3 n = to_gd(pr.plane.normal);
+		Dictionary d;
+		d["plane"] = Plane(n, (real_t)pr.plane.offset + n.dot(p_origin));
+		d["point"] = p_origin + to_gd(pr.point);
+		d["shape_index"] = shape_index_of(planes[(size_t)i].shapeId);
+		d["triangle_index"] = pr.triangleIndex;
+		d["child_index"] = pr.childIndex;
+		d["material_index"] = pr.materialIndex;
+		out.push_back(d);
+	}
+	return out;
+}
+
+Dictionary Box3DBody::time_of_impact_mover(const Vector3 &p_origin, const Dictionary &p_capsule,
+		const Vector3 &p_translation, int p_mask) const {
+	Dictionary d;
+	d["hit"] = false;
+	d["fraction"] = 1.0;
+	if (!body_live()) {
+		return d;
+	}
+	b3Capsule mover = dict_to_capsule(p_capsule);
+	b3WorldTransform xf = b3Body_GetTransform(body_id);
+	b3BodyTOIResult r = b3Body_TimeOfImpactMover(body_id, to_b3_pos(p_origin), &mover, to_b3(p_translation),
+			make_query_filter(p_mask), xf, xf);
+	d["fraction"] = r.fraction;
+	if (B3_IS_NULL(r.shapeId) || r.fraction >= 1.0f) {
+		return d;
+	}
+	d["hit"] = true;
+	d["position"] = to_gd_pos(r.point);
+	d["normal"] = to_gd(r.normal);
+	d["shape_index"] = shape_index_of(r.shapeId);
+	return d;
+}
+
+// Live per-shape access, continued ---------------------------------------------
+
+void Box3DBody::apply_wind(const Vector3 &p_wind, double p_drag, double p_lift, double p_max_speed, bool p_wake) {
+	for (b3ShapeId shape : shape_ids()) {
+		b3Shape_ApplyWind(shape, to_b3(p_wind), (float)p_drag, (float)p_lift, (float)p_max_speed, p_wake);
+	}
+}
+
+Dictionary Box3DBody::compute_shape_mass_data(int p_shape_index) const {
+	Dictionary d;
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return d;
+	}
+	b3MassData md = b3Shape_ComputeMassData(shape);
+	d["mass"] = md.mass;
+	d["local_center"] = to_gd(md.center);
+	d["rotational_inertia"] = matrix_to_basis(md.inertia);
+	return d;
+}
+
+Dictionary Box3DBody::get_shape_sphere(int p_shape_index) const {
+	Dictionary d;
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || b3Shape_GetType(shape) != b3_sphereShape) {
+		return d;
+	}
+	b3Sphere sphere = b3Shape_GetSphere(shape);
+	d["center"] = to_gd(sphere.center);
+	d["radius"] = sphere.radius;
+	return d;
+}
+
+void Box3DBody::set_shape_sphere(const Dictionary &p_sphere, int p_shape_index) {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return;
+	}
+	b3Sphere sphere;
+	sphere.center = to_b3((Vector3)p_sphere.get("center", Vector3()));
+	sphere.radius = (float)(double)p_sphere.get("radius", 0.5);
+	b3Shape_SetSphere(shape, &sphere);
+}
+
+Dictionary Box3DBody::get_shape_capsule(int p_shape_index) const {
+	Dictionary d;
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || b3Shape_GetType(shape) != b3_capsuleShape) {
+		return d;
+	}
+	b3Capsule capsule = b3Shape_GetCapsule(shape);
+	d["center1"] = to_gd(capsule.center1);
+	d["center2"] = to_gd(capsule.center2);
+	d["radius"] = capsule.radius;
+	return d;
+}
+
+void Box3DBody::set_shape_capsule(const Dictionary &p_capsule, int p_shape_index) {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return;
+	}
+	b3Capsule capsule = dict_to_capsule(p_capsule);
+	b3Shape_SetCapsule(shape, &capsule);
+}
+
+Dictionary Box3DBody::get_shape_hull(int p_shape_index) const {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || b3Shape_GetType(shape) != b3_hullShape) {
+		return Dictionary();
+	}
+	return hull_to_dict(b3Shape_GetHull(shape));
+}
+
+void Box3DBody::set_shape_hull(const PackedVector3Array &p_points, int p_shape_index) {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || p_points.size() < 4) {
+		return;
+	}
+	std::vector<b3Vec3> points((size_t)p_points.size());
+	for (int i = 0; i < p_points.size(); ++i) {
+		points[(size_t)i] = to_b3(p_points[i]);
+	}
+	int max_verts = p_points.size() < B3_MAX_HULL_VERTICES ? (int)p_points.size() : B3_MAX_HULL_VERTICES;
+	b3HullData *hull = b3CreateHull(points.data(), (int)points.size(), max_verts);
+	if (hull == nullptr) {
+		UtilityFunctions::push_warning("Box3DBody.set_shape_hull: could not build a convex hull from the points.");
+		return;
+	}
+	// The world's hull database copies the hull, so it can be released now.
+	b3Shape_SetHull(shape, hull);
+	b3DestroyHull(hull);
+}
+
+Dictionary Box3DBody::get_shape_mesh(int p_shape_index) const {
+	Dictionary d;
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || b3Shape_GetType(shape) != b3_meshShape) {
+		return d;
+	}
+	b3Mesh mesh = b3Shape_GetMesh(shape);
+	d["scale"] = to_gd(mesh.scale);
+	if (mesh.data == nullptr) {
+		return d;
+	}
+	PackedVector3Array vertices;
+	const b3Vec3 *verts = b3GetMeshVertices(mesh.data);
+	for (int i = 0; verts != nullptr && i < mesh.data->vertexCount; ++i) {
+		vertices.push_back(to_gd(verts[i]));
+	}
+	PackedInt32Array indices;
+	const b3MeshTriangle *tris = b3GetMeshTriangles(mesh.data);
+	for (int i = 0; tris != nullptr && i < mesh.data->triangleCount; ++i) {
+		indices.push_back(tris[i].index1);
+		indices.push_back(tris[i].index2);
+		indices.push_back(tris[i].index3);
+	}
+	PackedByteArray materials;
+	const uint8_t *mats = b3GetMeshMaterialIndices(mesh.data);
+	for (int i = 0; mats != nullptr && i < mesh.data->triangleCount; ++i) {
+		materials.push_back(mats[i]);
+	}
+	d["vertices"] = vertices;
+	d["indices"] = indices;
+	d["triangle_materials"] = materials;
+	d["vertex_count"] = mesh.data->vertexCount;
+	d["triangle_count"] = mesh.data->triangleCount;
+	d["material_count"] = mesh.data->materialCount;
+	d["aabb"] = aabb_to_gd(mesh.data->bounds);
+	return d;
+}
+
+void Box3DBody::set_shape_mesh(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices,
+		const Vector3 &p_scale, int p_shape_index) {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return;
+	}
+	if (p_vertices.size() < 3 || p_indices.size() < 3 || (p_indices.size() % 3) != 0) {
+		UtilityFunctions::push_warning("Box3DBody.set_shape_mesh: needs >= 3 vertices and a multiple-of-3 index array.");
+		return;
+	}
+	std::vector<b3Vec3> verts((size_t)p_vertices.size());
+	for (int i = 0; i < p_vertices.size(); ++i) {
+		verts[(size_t)i] = to_b3(p_vertices[i]);
+	}
+	std::vector<int32_t> idx((size_t)p_indices.size());
+	for (int i = 0; i < p_indices.size(); ++i) {
+		int32_t v = p_indices[i];
+		if (v < 0 || v >= p_vertices.size()) {
+			UtilityFunctions::push_warning("Box3DBody.set_shape_mesh: index out of range.");
+			return;
+		}
+		idx[(size_t)i] = v;
+	}
+	b3MeshDef def = {};
+	def.vertices = verts.data();
+	def.indices = idx.data();
+	def.vertexCount = (int)verts.size();
+	def.triangleCount = (int)idx.size() / 3;
+	def.weldVertices = true;
+	def.weldTolerance = 0.001f;
+	def.identifyEdges = true;
+	b3MeshData *data = b3CreateMesh(&def, nullptr, 0);
+	if (data == nullptr) {
+		return;
+	}
+	// Box3D references the mesh data: owned here until destroy_body().
+	extra_mesh_data.push_back(data);
+	b3Shape_SetMesh(shape, data, to_b3(p_scale));
+}
+
+Dictionary Box3DBody::get_shape_height_field(int p_shape_index) const {
+	Dictionary d;
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || b3Shape_GetType(shape) != b3_heightShape) {
+		return d;
+	}
+	const b3HeightFieldData *hf = b3Shape_GetHeightField(shape);
+	if (hf == nullptr) {
+		return d;
+	}
+	const int count = hf->columnCount * hf->rowCount;
+	const int cells = (hf->columnCount - 1) * (hf->rowCount - 1);
+	// Heights are stored quantized; decompress back to unscaled sample values.
+	PackedFloat32Array heights;
+	const uint16_t *compressed = b3GetHeightFieldCompressedHeights(hf);
+	for (int i = 0; compressed != nullptr && i < count; ++i) {
+		heights.push_back(hf->minHeight + hf->heightScale * (float)compressed[i]);
+	}
+	PackedByteArray materials;
+	const uint8_t *mats = b3GetHeightFieldMaterialIndices(hf);
+	for (int i = 0; mats != nullptr && i < cells; ++i) {
+		materials.push_back(mats[i]);
+	}
+	d["count_x"] = hf->columnCount;
+	d["count_z"] = hf->rowCount;
+	d["scale"] = to_gd(hf->scale);
+	d["min_height"] = hf->minHeight;
+	d["max_height"] = hf->maxHeight;
+	d["heights"] = heights;
+	d["materials"] = materials;
+	d["aabb"] = aabb_to_gd(hf->aabb);
+	d["clockwise"] = hf->clockwise != 0;
+	return d;
+}
+
+Dictionary Box3DBody::get_shape_compound(int p_shape_index) const {
+	Dictionary d;
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || b3Shape_GetType(shape) != b3_compoundShape) {
+		return d;
+	}
+	const b3CompoundData *compound = b3Shape_GetCompound(shape);
+	if (compound == nullptr) {
+		return d;
+	}
+	d["capsule_count"] = compound->capsuleCount;
+	d["hull_count"] = compound->hullCount;
+	d["mesh_count"] = compound->meshCount;
+	d["sphere_count"] = compound->sphereCount;
+	d["aabb"] = aabb_to_gd(compound->bounds);
+	Array materials;
+	const b3SurfaceMaterial *mats = b3GetCompoundMaterials(compound);
+	for (int i = 0; mats != nullptr && i < compound->materialCount; ++i) {
+		materials.push_back(material_to_dict(mats[i]));
+	}
+	d["materials"] = materials;
+	// Children in core order (capsules, hulls, meshes, spheres), each with
+	// type (b3ShapeType), transform, material_index and its geometry.
+	Array children;
+	int total = compound->capsuleCount + compound->hullCount + compound->meshCount + compound->sphereCount;
+	for (int i = 0; i < total; ++i) {
+		b3ChildShape child = b3GetCompoundChild(compound, i);
+		Dictionary c;
+		c["type"] = (int)child.type;
+		c["transform"] = to_gd_transform(child.transform);
+		c["material_index"] = (child.materialIndices != nullptr && child.materialCount > 0) ? (int)child.materialIndices[0] : 0;
+		switch (child.type) {
+			case b3_sphereShape:
+				c["center"] = to_gd(child.sphere.center);
+				c["radius"] = child.sphere.radius;
+				break;
+			case b3_capsuleShape:
+				c["center1"] = to_gd(child.capsule.center1);
+				c["center2"] = to_gd(child.capsule.center2);
+				c["radius"] = child.capsule.radius;
+				break;
+			case b3_hullShape:
+				c["hull"] = hull_to_dict(child.hull);
+				break;
+			case b3_meshShape:
+				c["scale"] = to_gd(child.mesh.scale);
+				c["triangle_count"] = child.mesh.data != nullptr ? child.mesh.data->triangleCount : 0;
+				break;
+			default:
+				break;
+		}
+		children.push_back(c);
+	}
+	d["children"] = children;
+	return d;
+}
+
+int Box3DBody::get_shape_mesh_material_count(int p_shape_index) const {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return 0;
+	}
+	return b3Shape_GetMeshMaterialCount(shape);
+}
+
+Dictionary Box3DBody::get_shape_mesh_material(int p_material_index, int p_shape_index) const {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || p_material_index < 0 || p_material_index >= b3Shape_GetMeshMaterialCount(shape)) {
+		return Dictionary();
+	}
+	return material_to_dict(b3Shape_GetMeshSurfaceMaterial(shape, p_material_index));
+}
+
+void Box3DBody::set_shape_mesh_material(const Dictionary &p_material, int p_material_index, int p_shape_index) {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || p_material_index < 0 || p_material_index >= b3Shape_GetMeshMaterialCount(shape)) {
+		return;
+	}
+	b3SurfaceMaterial mat = b3Shape_GetMeshSurfaceMaterial(shape, p_material_index);
+	dict_to_material(p_material, mat);
+	b3Shape_SetMeshMaterial(shape, mat, p_material_index);
+}
+
+void Box3DBody::set_shape_name(const String &p_name, int p_shape_index) {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return;
+	}
+	CharString utf8 = p_name.utf8();
+	b3Shape_SetName(shape, p_name.is_empty() ? nullptr : utf8.get_data());
+}
+
+String Box3DBody::get_shape_name(int p_shape_index) const {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return String();
+	}
+	const char *name = b3Shape_GetName(shape);
+	return name != nullptr ? String::utf8(name) : String();
+}
+
+void Box3DBody::set_shape_user_data(int64_t p_value, int p_shape_index) {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return;
+	}
+	b3Shape_SetUserData(shape, (void *)(intptr_t)p_value);
+}
+
+int64_t Box3DBody::get_shape_user_data(int p_shape_index) const {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return 0;
+	}
+	return (int64_t)(intptr_t)b3Shape_GetUserData(shape);
+}
+
+Array Box3DBody::get_shape_contact_data(int p_shape_index) const {
+	Array out;
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return out;
+	}
+	int capacity = b3Shape_GetContactCapacity(shape);
+	if (capacity <= 0) {
+		return out;
+	}
+	std::vector<b3ContactData> contacts((size_t)capacity);
+	int count = b3Shape_GetContactData(shape, contacts.data(), capacity);
+	for (int i = 0; i < count; ++i) {
+		out.push_back(contact_to_dict(contacts[(size_t)i]));
+	}
+	return out;
+}
+
+Array Box3DBody::get_shape_sensor_overlaps(int p_shape_index) const {
+	Array out;
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape) || world == nullptr) {
+		return out;
+	}
+	int capacity = b3Shape_GetSensorCapacity(shape);
+	if (capacity <= 0) {
+		return out;
+	}
+	std::vector<b3ShapeId> visitors((size_t)capacity);
+	int count = b3Shape_GetSensorData(shape, visitors.data(), capacity);
+	for (int i = 0; i < count; ++i) {
+		// body_from_shape validates the id (overlaps may hold destroyed shapes).
+		Box3DBody *body = world->body_from_shape(visitors[(size_t)i]);
+		if (body != nullptr && !out.has(body)) {
+			out.push_back(body);
+		}
+	}
+	return out;
+}
+
+void Box3DBody::destroy_shape(int p_shape_index, bool p_update_mass) {
+	b3ShapeId shape = shape_at(p_shape_index);
+	if (B3_IS_NULL(shape)) {
+		return;
+	}
+	b3DestroyShape(shape, p_update_mass);
+	debug_mass = b3Body_GetMass(body_id);
+}
+
+bool Box3DBody::is_contact_valid(const Vector3i &p_contact_id) const {
+	if (world != nullptr) {
+		world->join_async_step();
+	}
+	if (!world || !world->is_world_alive()) {
+		return false;
+	}
+	return b3Contact_IsValid(contact_id_to_b3(p_contact_id));
+}
+
+Dictionary Box3DBody::get_contact(const Vector3i &p_contact_id) const {
+	if (!is_contact_valid(p_contact_id)) {
+		return Dictionary();
+	}
+	return contact_to_dict(b3Contact_GetData(contact_id_to_b3(p_contact_id)));
+}
+
 void Box3DBody::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("apply_central_force", "force"), &Box3DBody::apply_central_force);
 	ClassDB::bind_method(D_METHOD("apply_central_impulse", "impulse"), &Box3DBody::apply_central_impulse);
@@ -1540,7 +2736,7 @@ void Box3DBody::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_auto_visual"), &Box3DBody::get_auto_visual);
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "body_type", PROPERTY_HINT_ENUM, "Static,Kinematic,Dynamic"), "set_body_type", "get_body_type");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "shape_type", PROPERTY_HINT_ENUM, "Box,Sphere,Capsule,Cylinder,Cone,Hull,Mesh,Fit Mesh"), "set_shape_type", "get_shape_type");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "shape_type", PROPERTY_HINT_ENUM, "Box,Sphere,Capsule,Cylinder,Cone,Hull,Mesh,Fit Mesh,Height Field"), "set_shape_type", "get_shape_type");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "box_size"), "set_box_size", "get_box_size");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sphere_radius", PROPERTY_HINT_RANGE, "0.01,100,0.01,or_greater"), "set_sphere_radius", "get_sphere_radius");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "capsule_radius", PROPERTY_HINT_RANGE, "0.01,100,0.01,or_greater"), "set_capsule_radius", "get_capsule_radius");
@@ -1625,6 +2821,85 @@ void Box3DBody::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_shape_closest_point", "target", "shape_index"), &Box3DBody::get_shape_closest_point, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("shape_raycast", "from", "to", "shape_index"), &Box3DBody::shape_raycast, DEFVAL(0));
 
+	// --- Extended core access III: full body/shape/contact API -----------------
+	ClassDB::bind_method(D_METHOD("set_sleep_enabled", "enabled"), &Box3DBody::set_sleep_enabled);
+	ClassDB::bind_method(D_METHOD("is_sleep_enabled"), &Box3DBody::is_sleep_enabled);
+	ClassDB::bind_method(D_METHOD("set_safety_factor", "factor"), &Box3DBody::set_safety_factor);
+	ClassDB::bind_method(D_METHOD("get_safety_factor"), &Box3DBody::get_safety_factor);
+	ClassDB::bind_method(D_METHOD("set_body_name", "name"), &Box3DBody::set_body_name);
+	ClassDB::bind_method(D_METHOD("get_body_name"), &Box3DBody::get_body_name);
+	ClassDB::bind_method(D_METHOD("set_bake_compound", "enabled"), &Box3DBody::set_bake_compound);
+	ClassDB::bind_method(D_METHOD("get_bake_compound"), &Box3DBody::get_bake_compound);
+	ClassDB::bind_method(D_METHOD("set_heightfield_heights", "heights"), &Box3DBody::set_heightfield_heights);
+	ClassDB::bind_method(D_METHOD("get_heightfield_heights"), &Box3DBody::get_heightfield_heights);
+	ClassDB::bind_method(D_METHOD("set_heightfield_count_x", "count"), &Box3DBody::set_heightfield_count_x);
+	ClassDB::bind_method(D_METHOD("get_heightfield_count_x"), &Box3DBody::get_heightfield_count_x);
+	ClassDB::bind_method(D_METHOD("set_heightfield_count_z", "count"), &Box3DBody::set_heightfield_count_z);
+	ClassDB::bind_method(D_METHOD("get_heightfield_count_z"), &Box3DBody::get_heightfield_count_z);
+	ClassDB::bind_method(D_METHOD("set_heightfield_scale", "scale"), &Box3DBody::set_heightfield_scale);
+	ClassDB::bind_method(D_METHOD("get_heightfield_scale"), &Box3DBody::get_heightfield_scale);
+	ClassDB::bind_method(D_METHOD("set_heightfield_materials", "materials"), &Box3DBody::set_heightfield_materials);
+	ClassDB::bind_method(D_METHOD("get_heightfield_materials"), &Box3DBody::get_heightfield_materials);
+
+	ClassDB::bind_method(D_METHOD("get_core_body_type"), &Box3DBody::get_core_body_type);
+	ClassDB::bind_method(D_METHOD("is_fast_rotation_allowed"), &Box3DBody::is_fast_rotation_allowed);
+	ClassDB::bind_method(D_METHOD("is_bullet"), &Box3DBody::is_bullet);
+	ClassDB::bind_method(D_METHOD("is_contact_recycling_enabled"), &Box3DBody::is_contact_recycling_enabled);
+	ClassDB::bind_method(D_METHOD("enable_hit_events", "enabled"), &Box3DBody::enable_hit_events);
+	ClassDB::bind_method(D_METHOD("get_body_position"), &Box3DBody::get_body_position);
+	ClassDB::bind_method(D_METHOD("get_body_rotation"), &Box3DBody::get_body_rotation);
+	ClassDB::bind_method(D_METHOD("get_local_rotational_inertia"), &Box3DBody::get_local_rotational_inertia);
+	ClassDB::bind_method(D_METHOD("get_world_inverse_rotational_inertia"), &Box3DBody::get_world_inverse_rotational_inertia);
+	ClassDB::bind_method(D_METHOD("get_min_extent"), &Box3DBody::get_min_extent);
+	ClassDB::bind_method(D_METHOD("get_max_extent"), &Box3DBody::get_max_extent);
+	ClassDB::bind_method(D_METHOD("get_max_extent_origin"), &Box3DBody::get_max_extent_origin);
+	ClassDB::bind_method(D_METHOD("get_motion_locks"), &Box3DBody::get_motion_locks);
+	ClassDB::bind_method(D_METHOD("get_box3d_world"), &Box3DBody::get_box3d_world);
+	ClassDB::bind_method(D_METHOD("get_joints"), &Box3DBody::get_joints);
+
+	ClassDB::bind_method(D_METHOD("cast_ray", "from", "to", "mask"), &Box3DBody::cast_ray, DEFVAL(-1));
+	ClassDB::bind_method(D_METHOD("cast_shape", "origin", "shape", "translation", "can_encroach", "mask"), &Box3DBody::cast_shape, DEFVAL(false), DEFVAL(-1));
+	ClassDB::bind_method(D_METHOD("overlap_shape", "origin", "shape", "mask"), &Box3DBody::overlap_shape, DEFVAL(-1));
+	ClassDB::bind_method(D_METHOD("collide_mover", "origin", "capsule", "mask"), &Box3DBody::collide_mover, DEFVAL(-1));
+	ClassDB::bind_method(D_METHOD("time_of_impact_mover", "origin", "capsule", "translation", "mask"), &Box3DBody::time_of_impact_mover, DEFVAL(-1));
+
+	ClassDB::bind_method(D_METHOD("apply_wind", "wind", "drag", "lift", "max_speed", "wake"), &Box3DBody::apply_wind, DEFVAL(10.0), DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("compute_shape_mass_data", "shape_index"), &Box3DBody::compute_shape_mass_data, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_sphere", "shape_index"), &Box3DBody::get_shape_sphere, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_shape_sphere", "sphere", "shape_index"), &Box3DBody::set_shape_sphere, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_capsule", "shape_index"), &Box3DBody::get_shape_capsule, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_shape_capsule", "capsule", "shape_index"), &Box3DBody::set_shape_capsule, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_hull", "shape_index"), &Box3DBody::get_shape_hull, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_shape_hull", "points", "shape_index"), &Box3DBody::set_shape_hull, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_mesh", "shape_index"), &Box3DBody::get_shape_mesh, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_shape_mesh", "vertices", "indices", "scale", "shape_index"), &Box3DBody::set_shape_mesh, DEFVAL(Vector3(1, 1, 1)), DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_height_field", "shape_index"), &Box3DBody::get_shape_height_field, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_compound", "shape_index"), &Box3DBody::get_shape_compound, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_mesh_material_count", "shape_index"), &Box3DBody::get_shape_mesh_material_count, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_mesh_material", "material_index", "shape_index"), &Box3DBody::get_shape_mesh_material, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_shape_mesh_material", "material", "material_index", "shape_index"), &Box3DBody::set_shape_mesh_material, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_shape_name", "name", "shape_index"), &Box3DBody::set_shape_name, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_name", "shape_index"), &Box3DBody::get_shape_name, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("set_shape_user_data", "value", "shape_index"), &Box3DBody::set_shape_user_data, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_user_data", "shape_index"), &Box3DBody::get_shape_user_data, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_contact_data", "shape_index"), &Box3DBody::get_shape_contact_data, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("get_shape_sensor_overlaps", "shape_index"), &Box3DBody::get_shape_sensor_overlaps, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("destroy_shape", "shape_index", "update_mass"), &Box3DBody::destroy_shape, DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("is_contact_valid", "contact_id"), &Box3DBody::is_contact_valid);
+	ClassDB::bind_method(D_METHOD("get_contact", "contact_id"), &Box3DBody::get_contact);
+
+	ADD_GROUP("", ""); // end the Axis Lock group
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "sleep_enabled"), "set_sleep_enabled", "is_sleep_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "safety_factor", PROPERTY_HINT_RANGE, "0.01,1,0.01"), "set_safety_factor", "get_safety_factor");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "body_name"), "set_body_name", "get_body_name");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "bake_compound"), "set_bake_compound", "get_bake_compound");
+	ADD_GROUP("Height Field", "heightfield_");
+	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "heightfield_heights"), "set_heightfield_heights", "get_heightfield_heights");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "heightfield_count_x", PROPERTY_HINT_RANGE, "0,4096,1,or_greater"), "set_heightfield_count_x", "get_heightfield_count_x");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "heightfield_count_z", PROPERTY_HINT_RANGE, "0,4096,1,or_greater"), "set_heightfield_count_z", "get_heightfield_count_z");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "heightfield_scale"), "set_heightfield_scale", "get_heightfield_scale");
+	ADD_PROPERTY(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "heightfield_materials"), "set_heightfield_materials", "get_heightfield_materials");
+
 	ADD_SIGNAL(MethodInfo("body_entered", PropertyInfo(Variant::OBJECT, "body", PROPERTY_HINT_RESOURCE_TYPE, "Box3DBody")));
 	ADD_SIGNAL(MethodInfo("body_exited", PropertyInfo(Variant::OBJECT, "body", PROPERTY_HINT_RESOURCE_TYPE, "Box3DBody")));
 	ADD_SIGNAL(MethodInfo("body_hit", PropertyInfo(Variant::OBJECT, "body", PROPERTY_HINT_RESOURCE_TYPE, "Box3DBody"),
@@ -1644,4 +2919,5 @@ void Box3DBody::_bind_methods() {
 	BIND_ENUM_CONSTANT(HULL);
 	BIND_ENUM_CONSTANT(MESH);
 	BIND_ENUM_CONSTANT(FIT_MESH);
+	BIND_ENUM_CONSTANT(HEIGHTFIELD);
 }

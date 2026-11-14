@@ -39,6 +39,7 @@ public:
 		HULL = 5,
 		MESH = 6,
 		FIT_MESH = 7, // box collider auto-sized to the child MeshInstance3D's bounds
+		HEIGHTFIELD = 8, // grid of height samples (heightfield_*), static bodies only
 	};
 
 private:
@@ -46,6 +47,12 @@ private:
 	// A triangle-mesh shape references this data (Box3D does not copy it), so it
 	// must outlive the shape; freed in destroy_body().
 	b3MeshData *mesh_data = nullptr;
+	// Same lifetime rule for the HEIGHTFIELD shape's data, the baked compound
+	// (bake_compound) and meshes handed to set_shape_mesh(): Box3D keeps
+	// pointers to all of them, so they are freed in destroy_body().
+	b3HeightFieldData *height_field_data = nullptr;
+	b3CompoundData *compound_data = nullptr;
+	std::vector<b3MeshData *> extra_mesh_data;
 	Box3DWorld *world = nullptr;
 
 	BodyType body_type = DYNAMIC;
@@ -109,6 +116,20 @@ private:
 	bool lock_angular_z = false;
 	uint32_t collision_layer = 1;
 	uint32_t collision_mask = 0xFFFFFFFFu;
+	// Extended core access III persistent state (applied in create_in_world).
+	bool sleep_enabled = true; // b3BodyDef.enableSleep
+	double safety_factor = 0.5; // b3BodyDef.safetyFactor (upstream default)
+	String body_name; // b3BodyDef.name (debug/recording label; empty = none)
+	bool bake_compound = false; // static compounds: one b3CreateBakedCompoundShape
+	// HEIGHTFIELD source: count_x * count_z samples, row-major along +Z rows
+	// (index = z * count_x + x). The field spans +X/+Z from the body origin;
+	// cell size is heightfield_scale.x/.z, heights are multiplied by .y.
+	PackedFloat32Array heightfield_heights;
+	int heightfield_count_x = 0;
+	int heightfield_count_z = 0;
+	Vector3 heightfield_scale = Vector3(1, 1, 1);
+	// Optional per-cell material indices ((count_x-1)*(count_z-1)); 255 = hole.
+	PackedByteArray heightfield_materials;
 	// When true and no MeshInstance3D child is present, a MeshInstance3D is
 	// generated at runtime whose mesh mirrors the collision shape (box/sphere/
 	// capsule/cylinder/cone), so box_size/sphere_radius/etc. drive both the
@@ -132,6 +153,10 @@ private:
 	// Creates/updates/removes auto_mesh_instance to match auto_visual and the
 	// current shape_type/size. No-op in the editor (runtime feature only).
 	void update_auto_visual();
+	// HEIGHTFIELD / bake_compound builders used by create_in_world().
+	void create_height_field_shape(const b3ShapeDef &p_def);
+	bool create_baked_compound(const Transform3D &p_body_inv);
+	void free_owned_geometry();
 
 protected:
 	static void _bind_methods();
@@ -335,9 +360,110 @@ public:
 	// Ray vs. a single shape: { hit, position, normal, fraction }.
 	Dictionary shape_raycast(const Vector3 &p_from, const Vector3 &p_to, int p_shape_index = 0) const;
 
+	// --- Extended core access III: full body/shape/contact API -----------------
+	// Persistent properties (applied at creation, live when in the world).
+	void set_sleep_enabled(bool p_enabled);
+	bool is_sleep_enabled() const;
+	void set_safety_factor(double p_factor);
+	double get_safety_factor() const;
+	void set_body_name(const String &p_name);
+	String get_body_name() const;
+	void set_bake_compound(bool p_enabled);
+	bool get_bake_compound() const;
+	void set_heightfield_heights(const PackedFloat32Array &p_heights);
+	PackedFloat32Array get_heightfield_heights() const;
+	void set_heightfield_count_x(int p_count);
+	int get_heightfield_count_x() const;
+	void set_heightfield_count_z(int p_count);
+	int get_heightfield_count_z() const;
+	void set_heightfield_scale(const Vector3 &p_scale);
+	Vector3 get_heightfield_scale() const;
+	void set_heightfield_materials(const PackedByteArray &p_materials);
+	PackedByteArray get_heightfield_materials() const;
+
+	// Live body state.
+	int get_core_body_type() const; // b3Body_GetType (-1 when not live)
+	bool is_fast_rotation_allowed() const;
+	bool is_bullet() const;
+	bool is_contact_recycling_enabled() const;
+	void enable_hit_events(bool p_enabled); // every shape on the body
+	Vector3 get_body_position() const; // body origin, straight from the solver
+	Quaternion get_body_rotation() const;
+	Basis get_local_rotational_inertia() const;
+	Basis get_world_inverse_rotational_inertia() const;
+	double get_min_extent() const;
+	Vector3 get_max_extent() const;
+	Vector3 get_max_extent_origin() const;
+	Dictionary get_motion_locks() const;
+	// The Box3DWorld this body is simulated in (null when not live).
+	Object *get_box3d_world() const;
+	// Joints attached to this body: Array of { joint_id, type, body_a, body_b }.
+	Array get_joints() const;
+
+	// Queries against this body alone, at its current transform. Shape
+	// descriptions (Dictionary) for cast_shape / overlap_shape:
+	//   { radius }                      sphere (radius 0 = point)
+	//   { half_extents: Vector3 }       box (optional rotation: Quaternion)
+	//   { center1, center2, radius }    capsule (local to origin)
+	//   { height, radius }              upright capsule, total height
+	//   { points: PackedVector3Array, radius } generic convex point cloud
+	// Results: { hit, position, normal, fraction, triangle_index,
+	//            user_material_id, shape_index }.
+	Dictionary cast_ray(const Vector3 &p_from, const Vector3 &p_to, int p_mask = -1) const;
+	Dictionary cast_shape(const Vector3 &p_origin, const Dictionary &p_shape, const Vector3 &p_translation,
+			bool p_can_encroach = false, int p_mask = -1) const;
+	bool overlap_shape(const Vector3 &p_origin, const Dictionary &p_shape, int p_mask = -1) const;
+	// Character mover (capsule dictionary: {center1, center2, radius} or
+	// {height, radius}). collide_mover returns Array of { plane (world),
+	// point, shape_index, triangle_index, child_index, material_index }.
+	Array collide_mover(const Vector3 &p_origin, const Dictionary &p_capsule, int p_mask = -1) const;
+	// { hit, position, normal, fraction, shape_index } for a swept mover.
+	Dictionary time_of_impact_mover(const Vector3 &p_origin, const Dictionary &p_capsule,
+			const Vector3 &p_translation, int p_mask = -1) const;
+
+	// Live per-shape access, continued (shape_index as above). Geometry setters
+	// target one shape and do not change the mass; call reset_mass() after.
+	void apply_wind(const Vector3 &p_wind, double p_drag, double p_lift, double p_max_speed = 10.0, bool p_wake = true);
+	Dictionary compute_shape_mass_data(int p_shape_index = 0) const;
+	Dictionary get_shape_sphere(int p_shape_index = 0) const;
+	void set_shape_sphere(const Dictionary &p_sphere, int p_shape_index = 0);
+	Dictionary get_shape_capsule(int p_shape_index = 0) const;
+	void set_shape_capsule(const Dictionary &p_capsule, int p_shape_index = 0);
+	Dictionary get_shape_hull(int p_shape_index = 0) const;
+	void set_shape_hull(const PackedVector3Array &p_points, int p_shape_index = 0);
+	Dictionary get_shape_mesh(int p_shape_index = 0) const;
+	void set_shape_mesh(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices,
+			const Vector3 &p_scale = Vector3(1, 1, 1), int p_shape_index = 0);
+	Dictionary get_shape_height_field(int p_shape_index = 0) const;
+	Dictionary get_shape_compound(int p_shape_index = 0) const;
+	int get_shape_mesh_material_count(int p_shape_index = 0) const;
+	Dictionary get_shape_mesh_material(int p_material_index, int p_shape_index = 0) const;
+	void set_shape_mesh_material(const Dictionary &p_material, int p_material_index, int p_shape_index = 0);
+	void set_shape_name(const String &p_name, int p_shape_index = 0);
+	String get_shape_name(int p_shape_index = 0) const;
+	// Opaque integer tag stored in the shape's user data (never dereferenced).
+	void set_shape_user_data(int64_t p_value, int p_shape_index = 0);
+	int64_t get_shape_user_data(int p_shape_index = 0) const;
+	// Contacts touching one shape, with full manifolds (see get_contact).
+	Array get_shape_contact_data(int p_shape_index = 0) const;
+	// Bodies currently overlapping a sensor shape (empty for non-sensors).
+	Array get_shape_sensor_overlaps(int p_shape_index = 0) const;
+	// Removes one live shape (until the next rebuild recreates the body).
+	void destroy_shape(int p_shape_index, bool p_update_mass = true);
+
+	// Contact ids are Vector3i(index1, world0, generation), as found in the
+	// contact_id key of get_contact_data / get_shape_contact_data entries.
+	bool is_contact_valid(const Vector3i &p_contact_id) const;
+	Dictionary get_contact(const Vector3i &p_contact_id) const;
+
 private:
 	// The body's live shape ids (empty when the body is not in the world).
 	std::vector<b3ShapeId> shape_ids() const;
+	// Index of p_shape in shape_ids(), or -1.
+	int shape_index_of(b3ShapeId p_shape) const;
+	// Valid live shape at p_index, or b3_nullShapeId.
+	b3ShapeId shape_at(int p_index) const;
+	Dictionary contact_to_dict(const b3ContactData &p_contact) const;
 };
 
 } // namespace godot
