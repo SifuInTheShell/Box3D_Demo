@@ -7,6 +7,8 @@
 
 #include <box3d/box3d.h>
 
+#include <cmath>
+
 namespace godot {
 
 class Box3DWorld;
@@ -38,6 +40,15 @@ protected:
 	// value, so a sleeping body would ignore a new drive command; every setter
 	// that changes a drive target calls this.
 	void wake_bodies();
+
+	// --- Extended core access III: hooks for live readback / body ordering ---
+	// Subclasses append their engine-side settings (read back through the b3
+	// getters, i.e. after the engine's own clamping) to get_live_settings().
+	virtual void fill_live_settings(Dictionary &r_settings) const {}
+	// True for joints whose b3 body order is (ground, driven body) while this
+	// node's body_a is the driven body (mover / pogo). Frame/body accessors on
+	// the base class honor it so "a" always means this node's body_a.
+	virtual bool swaps_bodies() const { return false; }
 
 	// Subclasses fill in their specific joint def and create it.
 	virtual b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
@@ -76,8 +87,10 @@ public:
 	double get_force_threshold() const;
 	void set_torque_threshold(double p_torque);
 	double get_torque_threshold() const;
-	// The core b3JointType of this joint (parallel/distance/filter/motor/
-	// prismatic/revolute/spherical/weld/wheel), returned as its enum int.
+	// The core b3JointType of this joint, returned as its enum int (-1 when
+	// not created): 0 parallel, 1 distance, 2 filter, 3 motor, 4 prismatic,
+	// 5 revolute, 6 spherical, 7 weld, 8 wheel, 9 mover, 10 pogo. Also bound
+	// as Box3DJoint.JOINT_TYPE_* constants (Extended core access III).
 	int get_joint_type() const;
 	// The joint's anchor frames on each body, in that body's local space.
 	// Reading/writing these retargets the constraint without recreating it.
@@ -89,6 +102,28 @@ public:
 	// (hertz, 0 = rigid) and damping ratio. get returns { hertz, damping }.
 	Dictionary get_constraint_tuning() const;
 	void set_constraint_tuning(double p_hertz, double p_damping);
+
+	// --- Extended core access III: identity, sleep state, live readback -------
+	// Naming convention for live readouts added in this section: get_current_*
+	// reads a simulation quantity (angle, speed, applied force/torque) and
+	// returns 0 / neutral when the joint isn't created; the plain property
+	// getters keep returning the cached configured value. get_live_settings()
+	// returns every engine-side configuration value through the b3 getters
+	// (empty Dictionary when the joint isn't created).
+	bool is_awake() const;
+	void wake_connected_bodies();
+	// The Box3DBody nodes the live joint connects (b3Joint_GetBodyA/B mapped
+	// through body user data); null for the static world anchor.
+	Box3DBody *get_body_a_node() const;
+	Box3DBody *get_body_b_node() const;
+	// The Box3DWorld node owning the live joint (b3Joint_GetWorld).
+	Box3DWorld *get_world_node() const;
+	Dictionary get_live_settings() const;
+	// b3 joint user data is set to the owning Box3DJoint node at creation (the
+	// node itself is the user data; no separate GDScript user-data slot is
+	// exposed — use Object meta for that). Maps a joint id (e.g. from world
+	// joint events) back to its node; null if unknown.
+	static Box3DJoint *from_joint_id(b3JointId p_id);
 };
 
 // Revolute joint: rotates about this node's local Z axis (the blue gizmo arrow).
@@ -104,11 +139,13 @@ class Box3DHingeJoint : public Box3DJoint {
 	bool spring_enabled = false;
 	double spring_hertz = 1.0;
 	double spring_damping = 0.7;
+	double target_angle = 0.0; // radians, spring target (Extended core access III)
 
 protected:
 	static void _bind_methods();
 	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
 			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
+	void fill_live_settings(Dictionary &r_settings) const override;
 
 public:
 	void set_limit_enabled(bool p_v);
@@ -129,6 +166,13 @@ public:
 	double get_spring_hertz() const;
 	void set_spring_damping(double p_v);
 	double get_spring_damping() const;
+
+	// --- Extended core access III: spring target + live readouts ---------------
+	// Angle the spring drives toward, in [-PI, PI] (0 = the authored pose).
+	void set_target_angle(double p_v);
+	double get_target_angle() const;
+	double get_current_angle() const;
+	double get_current_motor_torque() const;
 };
 
 // Prismatic joint: body_b slides along this node's local X axis (the red gizmo arrow).
@@ -141,11 +185,17 @@ class Box3DSliderJoint : public Box3DJoint {
 	bool motor_enabled = false;
 	double motor_speed = 0.0; // meters / second
 	double max_motor_force = 0.0;
+	// Extended core access III: linear spring along the axis.
+	bool spring_enabled = false;
+	double spring_hertz = 1.0;
+	double spring_damping = 0.7;
+	double target_translation = 0.0; // meters
 
 protected:
 	static void _bind_methods();
 	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
 			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
+	void fill_live_settings(Dictionary &r_settings) const override;
 
 public:
 	void set_limit_enabled(bool p_v);
@@ -160,6 +210,19 @@ public:
 	double get_motor_speed() const;
 	void set_max_motor_force(double p_v);
 	double get_max_motor_force() const;
+
+	// --- Extended core access III: spring, target, live readouts ---------------
+	void set_spring_enabled(bool p_v);
+	bool get_spring_enabled() const;
+	void set_spring_hertz(double p_v);
+	double get_spring_hertz() const;
+	void set_spring_damping(double p_v);
+	double get_spring_damping() const;
+	void set_target_translation(double p_v);
+	double get_target_translation() const;
+	double get_current_translation() const;
+	double get_current_speed() const;
+	double get_current_motor_force() const;
 };
 
 // Distance joint: keeps body_a and body_b a set distance apart. Rope / rod / spring.
@@ -173,11 +236,20 @@ class Box3DDistanceJoint : public Box3DJoint {
 	bool limit_enabled = false;
 	double min_length = 0.0;
 	double max_length = 10.0;
+	// Extended core access III: spring force range + motor.
+	double lower_spring_force = -INFINITY; // tension the spring can sustain (<= 0)
+	double upper_spring_force = INFINITY; // compression the spring can sustain
+	bool motor_enabled = false;
+	double motor_speed = 0.0; // meters / second
+	double max_motor_force = 0.0;
+
+	void apply_spring_force_range();
 
 protected:
 	static void _bind_methods();
 	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
 			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
+	void fill_live_settings(Dictionary &r_settings) const override;
 
 public:
 	void set_length(double p_v);
@@ -194,6 +266,22 @@ public:
 	double get_min_length() const;
 	void set_max_length(double p_v);
 	double get_max_length() const;
+
+	// --- Extended core access III: spring force range, motor, live readouts ----
+	// The motor (like the limit) only acts while spring_enabled is on; a
+	// non-spring distance joint is rigid.
+	void set_lower_spring_force(double p_v);
+	double get_lower_spring_force() const;
+	void set_upper_spring_force(double p_v);
+	double get_upper_spring_force() const;
+	void set_motor_enabled(bool p_v);
+	bool get_motor_enabled() const;
+	void set_motor_speed(double p_v);
+	double get_motor_speed() const;
+	void set_max_motor_force(double p_v);
+	double get_max_motor_force() const;
+	double get_current_length() const;
+	double get_current_motor_force() const;
 };
 
 // Ball / spherical joint: a point on body_b is pinned to a point on body_a,
@@ -211,11 +299,20 @@ class Box3DBallJoint : public Box3DJoint {
 	double spring_hertz = 1.0;
 	double spring_damping = 0.7;
 	double friction_torque = 0.0; // > 0 enables a zero-target motor = dry joint friction
+	// Extended core access III: spring target + velocity motor.
+	Quaternion target_rotation; // frame B relative to frame A
+	bool motor_enabled = false;
+	Vector3 motor_velocity; // radians / second, world space (wB - wA)
+	double max_motor_torque = 0.0;
+
+	// Pushes the effective motor state (explicit motor, else friction) live.
+	void apply_motor();
 
 protected:
 	static void _bind_methods();
 	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
 			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
+	void fill_live_settings(Dictionary &r_settings) const override;
 
 public:
 	void set_cone_limit_enabled(bool p_v);
@@ -236,6 +333,21 @@ public:
 	double get_spring_damping() const;
 	void set_friction_torque(double p_v);
 	double get_friction_torque() const;
+
+	// --- Extended core access III: target rotation, motor, live readouts -------
+	// motor_enabled takes precedence over friction_torque (which is itself a
+	// zero-velocity motor); with it off, friction_torque behaves as before.
+	void set_target_rotation(const Quaternion &p_v);
+	Quaternion get_target_rotation() const;
+	void set_motor_enabled(bool p_v);
+	bool get_motor_enabled() const;
+	void set_motor_velocity(const Vector3 &p_v);
+	Vector3 get_motor_velocity() const;
+	void set_max_motor_torque(double p_v);
+	double get_max_motor_torque() const;
+	double get_current_twist_angle() const;
+	double get_current_cone_angle() const;
+	Vector3 get_current_motor_torque() const;
 };
 
 // Fixed / weld joint: rigidly locks two bodies together.
@@ -244,17 +356,26 @@ class Box3DFixedJoint : public Box3DJoint {
 
 	double linear_hertz = 0.0;  // 0 = perfectly rigid
 	double angular_hertz = 0.0; // 0 = perfectly rigid
+	double linear_damping = 0.0; // Extended core access III (b3 default 0)
+	double angular_damping = 0.0;
 
 protected:
 	static void _bind_methods();
 	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
 			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
+	void fill_live_settings(Dictionary &r_settings) const override;
 
 public:
 	void set_linear_hertz(double p_v);
 	double get_linear_hertz() const;
 	void set_angular_hertz(double p_v);
 	double get_angular_hertz() const;
+
+	// --- Extended core access III: spring damping ratios -----------------------
+	void set_linear_damping(double p_v);
+	double get_linear_damping() const;
+	void set_angular_damping(double p_v);
+	double get_angular_damping() const;
 };
 
 // Wheel joint: body_a is the chassis, body_b the wheel. The wheel travels on a
@@ -326,6 +447,13 @@ public:
 	// Live readouts from the simulation (0 when the joint isn't created yet).
 	double get_spin_speed() const;
 	double get_steering_angle() const;
+
+	// --- Extended core access III: applied torques -----------------------------
+	double get_current_spin_torque() const;
+	double get_current_steering_torque() const;
+
+protected:
+	void fill_live_settings(Dictionary &r_settings) const override;
 };
 
 // Parallel joint: a spring that keeps the two bodies' copies of the node's
@@ -342,6 +470,7 @@ protected:
 	static void _bind_methods();
 	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
 			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
+	void fill_live_settings(Dictionary &r_settings) const override; // Extended core access III
 
 public:
 	void set_spring_hertz(double p_v);
@@ -375,6 +504,7 @@ protected:
 	static void _bind_methods();
 	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
 			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
+	void fill_live_settings(Dictionary &r_settings) const override; // Extended core access III
 
 public:
 	void set_linear_velocity(const Vector3 &p_v);
@@ -397,6 +527,114 @@ public:
 	double get_angular_damping() const;
 	void set_max_spring_torque(double p_v);
 	double get_max_spring_torque() const;
+};
+
+// --- Extended core access III: upstream character-mover joints ---------------
+
+// Mover joint (experimental upstream): drives the horizontal velocity of a
+// dynamic character. body_a is the driven character, body_b the ground or
+// platform it moves relative to (empty = the static world). Force is applied
+// only in the XZ plane of this node's frame on body_a (keep the node's Y up),
+// capped by max_force; vertical motion is left to gravity / a Box3DPogoJoint.
+// linear_velocity is the desired world-space velocity of body_a relative to
+// body_b. collide_connected defaults to true here: the character must still
+// stand on its ground body. (Internally b3 orders the bodies ground-first;
+// get_local_frame_a/b and get_body_a/b_node still refer to this node's body_a/b.)
+class Box3DMoverJoint : public Box3DJoint {
+	GDCLASS(Box3DMoverJoint, Box3DJoint)
+
+	Vector3 linear_velocity;
+	double max_force = 1000.0;
+
+protected:
+	static void _bind_methods();
+	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
+			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
+	void fill_live_settings(Dictionary &r_settings) const override;
+	bool swaps_bodies() const override { return true; }
+
+public:
+	Box3DMoverJoint();
+
+	void set_linear_velocity(const Vector3 &p_v);
+	Vector3 get_linear_velocity() const;
+	void set_max_force(double p_v);
+	double get_max_force() const;
+};
+
+// Pogo joint (experimental upstream): a one-dimensional spring that holds a
+// dynamic character above the ground, as in upstream's DynamicMover. body_a is
+// the character, body_b the ground body (empty = the static world). The pogo
+// axis is this node's local Y on body_a; the spring pushes along `normal`
+// (world-space ground normal) to keep the foot point rest_length below the
+// node origin. At creation both anchors sit at the node origin (length 0);
+// feed a ground ray hit each physics frame with set_ground_point() and
+// set_normal(), like the sample does. max_compression_force bounds how hard it
+// pushes up, max_tension_force how hard it may pull down (0 = never, e.g.
+// while jumping). collide_connected defaults to true. (b3 orders the bodies
+// ground-first internally; base frame/body accessors still use this node's
+// body_a/b.)
+class Box3DPogoJoint : public Box3DJoint {
+	GDCLASS(Box3DPogoJoint, Box3DJoint)
+
+	Vector3 normal = Vector3(0, 1, 0);
+	double spring_hertz = 3.0;
+	double spring_damping = 0.8;
+	double rest_length = 0.9;
+	double max_tension_force = 0.0;
+	double max_compression_force = 100000.0;
+	double initial_impulse = 0.0; // warm start for a recreated pogo
+	double initial_speed = 0.0;
+
+	static b3Vec3 safe_normal(const Vector3 &p_n);
+
+protected:
+	static void _bind_methods();
+	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
+			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
+	void fill_live_settings(Dictionary &r_settings) const override;
+	bool swaps_bodies() const override { return true; }
+
+public:
+	Box3DPogoJoint();
+
+	void set_normal(const Vector3 &p_v);
+	Vector3 get_normal() const;
+	void set_spring_hertz(double p_v);
+	double get_spring_hertz() const;
+	void set_spring_damping(double p_v);
+	double get_spring_damping() const;
+	void set_rest_length(double p_v);
+	double get_rest_length() const;
+	void set_max_tension_force(double p_v);
+	double get_max_tension_force() const;
+	void set_max_compression_force(double p_v);
+	double get_max_compression_force() const;
+	void set_initial_impulse(double p_v);
+	double get_initial_impulse() const;
+	void set_initial_speed(double p_v);
+	double get_initial_speed() const;
+	// Moves the ground-side anchor to a world-space point (a ray hit), in the
+	// ground body's local space. No-op when the joint isn't created.
+	void set_ground_point(const Vector3 &p_world_point);
+	// Live readouts (0 when the joint isn't created).
+	double get_current_length() const;
+	double get_current_speed() const;
+	double get_current_impulse() const;
+};
+
+// Filter joint: no constraint at all — it only disables collision between
+// body_a and body_b (and, as a side effect of being a joint, keeps them in the
+// same simulation island). Set both bodies; with body_b empty it filters
+// against an invisible static anchor and does nothing useful.
+// collide_connected is ignored (always false).
+class Box3DFilterJoint : public Box3DJoint {
+	GDCLASS(Box3DFilterJoint, Box3DJoint)
+
+protected:
+	static void _bind_methods();
+	b3JointId create_specific(b3WorldId p_world, b3BodyId p_a, b3BodyId p_b,
+			const Transform3D &p_xf_a, const Transform3D &p_xf_b, const Transform3D &p_joint) override;
 };
 
 } // namespace godot
