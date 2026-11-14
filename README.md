@@ -22,9 +22,10 @@ across machines).
 ### Box3D engine — with a near-complete binding
 
 We extended this fork's GDExtension to cover **nearly the whole Box3D C API** —
-from roughly a third of Box3D's ~420 core functions to almost all of them, added
-purely additively so existing scripts keep working. The rebuilt Windows DLLs
-committed here already contain it. Newly reachable from GDScript:
+from roughly a third of Box3D's public functions to almost all of them, added
+purely additively so existing scripts keep working. The committed Linux
+libraries contain all of it; the committed Windows DLLs predate the latest
+sync and need a rebuild (`tools\update_box3d.bat`). Newly reachable from GDScript:
 
 - **World** — live diagnostics (`get_counters`, `get_profile`,
   `get_awake_body_count`, `get_bounds`), `overlap_aabb`, an all-hits
@@ -47,9 +48,12 @@ committed here already contain it. Newly reachable from GDScript:
 The exact additions vs. the base fork (every extended World / Body / Joint
 method, categorized): [`docs/box3d-binding-extensions.md`](docs/box3d-binding-extensions.md).
 Build and API tour: [`docs/box3d-build-and-use.md`](docs/box3d-build-and-use.md).
-(A few self-contained pieces are deliberately deferred: solver callbacks,
-replay *playback*, and the heightfield / baked-compound / filter-joint
-constructors.)
+After the engine sync to upstream `be8c731`, the binding covers **618 of
+Box3D's 624 public C functions**: upstream's new static queries and
+mover / pogo / filter joints, replay *playback* (`Box3DReplayPlayer`), height
+fields and baked compounds, thread-safe data-driven solver callbacks, and the
+standalone geometry API (`Box3DGeometry`, `Box3DDynamicTree`). The six left
+out (and why) are listed in the extensions doc.
 
 The base engine capabilities the binding surfaces: static / kinematic / dynamic
 bodies; box, sphere, capsule, cylinder, cone, convex-hull and triangle-mesh

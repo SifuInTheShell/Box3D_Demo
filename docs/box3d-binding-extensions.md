@@ -12,7 +12,7 @@ wrapper vendored here in `extern/box3d-godot/godot/`.
   `erincatto/box3d` (current pin in `extern/box3d-godot/UPSTREAM_COMMIT`). It
   exposed the core of Box3D — worlds, bodies, the shape types, the joint set,
   a character controller, basic queries and contact events — roughly a third
-  of Box3D's ~420 public C functions.
+  of Box3D's public C functions.
 - **What we did:** extended the C++ wrapper *additively* to surface nearly the
   whole remaining C API to GDScript, so existing scripts keep working
   unchanged. Every addition sits under a
@@ -38,8 +38,8 @@ wrapper vendored here in `extern/box3d-godot/godot/`.
   alongside the pre-existing sphere/ray casts).
 - **Deterministic recording → replay** — `start_recording(byte_capacity)`,
   `stop_recording()` → `PackedByteArray`, `is_recording()`, and the static
-  `Box3DWorld.validate_replay(data, worker_count)`. (Replay *playback* into a
-  live world is deliberately deferred — see below.)
+  `Box3DWorld.validate_replay(data, worker_count)`. Playback:
+  `Box3DReplayPlayer` (see "Extended core access III" below).
 - **Solver tuning** — speculative-contact toggle (`enable_speculative`),
   `restitution_threshold`, `hit_event_threshold`, and
   `contact_recycle_distance` (Catto's stack stabilizer), each exposed as a
@@ -106,14 +106,77 @@ unconfigurable from GDScript):
 - **Motor** — linear/angular target velocity, max force/torque, spring
   hertz/damping, max spring force/torque.
 
-## Deliberately deferred
+## Extended core access III — the full public C API
 
-A few self-contained pieces upstream exposes were left for later:
+After syncing the engine to upstream `be8c731` the binding was taken to
+**618 of the 624 `B3_API` functions** in `include/box3d/*.h` (every one in
+`box3d.h`, `collision.h`, `constants.h` and `math_functions.h` that has a
+GDScript-meaningful form). New code sits under
+`// --- Extended core access III ---` banners. Runtime coverage lives in
+`godot/demo/tests/test_extended_api.tscn`.
 
-- **Replay playback** — recording and `validate_replay` ship; feeding a
-  recording back into a live world does not.
-- **Solver callbacks** (custom filter / pre-solve hooks).
-- The **heightfield**, **baked-compound**, and **filter-joint** constructors.
+- **`Box3DWorld`** — upstream's static-only queries (`cast_ray_static`,
+  `overlap_aabb_static`, `overlap_shape_static`, `cast_shape_static`), general
+  `overlap_shape` / `cast_shape` with `{type: sphere|capsule|box|points}`
+  dictionaries, `cast_mover`, `get_body_move_events()`, a `joint_event(joint,
+  joint_id)` signal (fires past a joint's force/torque threshold),
+  `get_debug_draw_data()` (runs `b3World_Draw` and returns the primitives),
+  live engine reads (`get_live_gravity`, `is_sleeping_enabled`, …),
+  `restitution_iterations`, `enable_restitution_propagation`,
+  `isotropic_inertia_tolerance`, `enable_sse2_fallback`, live `worker_count`,
+  `dump_memory_stats()`, `get_world_count()`.
+- **Solver callbacks, made thread-safe.** Box3D calls pre-solve / friction /
+  restitution / custom-filter callbacks from solver worker threads, so they
+  never call GDScript. They are data-driven instead: `friction_mix` /
+  `restitution_mix` (`MixRule`: default, average, min, max, multiply,
+  geometric), body-pair and layer-pair collision rules
+  (`set_body_pair_collision_enabled`, `set_layer_pair_collision_enabled`;
+  bodies opt in with `Box3DBody.custom_filtering = true`), and one-way
+  platforms (`set_one_way_platform(body, normal, min_dot)`).
+- **`Box3DBody`** — live `gravity_scale` / damping / `body_type` /
+  fast rotation (no rebuild), `sleep_enabled`, `safety_factor`, `body_name`,
+  extents, rotational inertia, motion locks, `get_joints()` (with the joint
+  node), per-body `cast_ray` / `cast_shape` / `overlap_shape` /
+  `collide_mover` / `time_of_impact_mover`, and per-shape geometry get/set
+  (sphere, capsule, hull, mesh, height field, compound), mass data, contact
+  manifolds, sensor overlaps, wind, names, mesh materials, `destroy_shape`,
+  `is_contact_valid` / `get_contact`. New `HEIGHTFIELD` shape type
+  (`heightfield_*` properties) and `bake_compound` for static compound bodies
+  (`b3CreateBakedCompoundShape`).
+- **Joints** — `get_current_*` live readouts on every type (angle,
+  translation, length, speed, motor force/torque, twist/cone angle),
+  `get_live_settings()`, `is_awake()`, `get_body_a_node()` /
+  `get_body_b_node()`, plus the previously missing features: hinge
+  `target_angle`, slider spring + `target_translation`, distance motor and
+  spring force range, ball motor + `target_rotation`, fixed-joint damping.
+  New nodes: **`Box3DMoverJoint`**, **`Box3DPogoJoint`** (upstream's dynamic
+  character mover) and **`Box3DFilterJoint`** (disable collision between two
+  bodies). Live setters now update a running joint instead of recreating it.
+- **`Box3DReplayPlayer`** (RefCounted) — replay *playback*: open a recording
+  from `Box3DWorld.stop_recording()` or a file, step / sub-step / seek /
+  restart, divergence detection, per-body transforms and velocities, frame
+  queries, keyframe policy, debug-draw data, and `save_recording` /
+  `load_recording`.
+- **`Box3DGeometry`** (static methods) — the world-independent API:
+  hull / mesh / height-field / compound construction and readback, mass and
+  AABB computation, ray / shape casts, `shape_distance`, `time_of_impact`,
+  every `b3Collide*` manifold via `collide()`, 2D hulls, `solve_planes` /
+  `clip_vector`, math validators, version / timer / hash utilities,
+  length units, Box3D log routing (`set_log_mode`), default filter, graph
+  colours. **`Box3DDynamicTree`** (RefCounted) wraps the standalone
+  `b3DynamicTree` BVH.
+
+### Intentionally unbound (6)
+
+- `b3Body_SetUserData`, `b3World_SetUserData` — the wrapper owns user data
+  (it points at the Godot node; events and queries depend on that mapping).
+- `b3Shape_GetWorld` — a shape's world is its body's (`get_box3d_world()`).
+- `b3SetAssertFcn` (and the allocator hook) — called from engine threads
+  mid-failure / on every allocation; not safe to route into script.
+- `b3SaveRecordingToFile` — needs a live `b3Recording*`; recordings are plain
+  byte buffers, so `Box3DReplayPlayer.save_recording` writes the same bytes.
+- `b3World_DumpShapeBounds` — declared upstream but not implemented (linking
+  it would leave an undefined symbol).
 
 ## Verifying the binding
 
@@ -124,9 +187,10 @@ GODOT=<path to Godot 4.7.1>
 "$GODOT" --headless --path extern/box3d-godot/godot/demo --import
 "$GODOT" --headless --path extern/box3d-godot/godot/demo res://tests/test_features.tscn -- --selftest
 "$GODOT" --headless --path extern/box3d-godot/godot/demo res://tests/test_samples.tscn  -- --selftest
+"$GODOT" --headless --path extern/box3d-godot/godot/demo res://tests/test_extended_api.tscn -- --selftest
 ```
 
 Expect 47 `[test]` lines and 33 `[samples]` lines (each counting the final
-`ALL -> PASS`). The full node/property/method reference is
+`ALL -> PASS`), plus an all-PASS `[ext]` run. The full node/property/method reference is
 `extern/box3d-godot/godot/README.md`; the build and upstream-sync procedure is
 [`box3d-build-and-use.md`](box3d-build-and-use.md).

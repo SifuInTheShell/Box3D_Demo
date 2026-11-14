@@ -107,6 +107,7 @@ private:
 	// Upstream stabilizer for big stacks: matching contacts are reused between
 	// steps while a pair barely moves, keeping warm-start impulses intact.
 	bool contact_recycling = true; // mirrors b3BodyDef.enableContactRecycling
+	bool custom_filtering = false; // b3ShapeDef.enableCustomFiltering (world pair/layer rules)
 	bool allow_fast_rotation = false;
 	bool lock_linear_x = false;
 	bool lock_linear_y = false;
@@ -264,6 +265,8 @@ public:
 	void set_continuous(bool p_enabled);
 	bool get_continuous() const;
 	void set_contact_recycling(bool p_enabled);
+	void set_custom_filtering(bool p_enabled);
+	bool get_custom_filtering() const;
 	bool get_contact_recycling() const;
 	void set_sync_node_transform(bool p_enabled);
 	bool get_sync_node_transform() const;

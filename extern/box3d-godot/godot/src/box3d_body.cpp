@@ -5,6 +5,7 @@
 
 #include "box3d_collision_shape.h"
 #include "box3d_conversions.h"
+#include "box3d_joint.h"
 #include "box3d_world.h"
 
 #include <godot_cpp/classes/box_mesh.hpp>
@@ -161,6 +162,7 @@ void Box3DBody::create_in_world() {
 	// Hit events power the debug draw's impact flash; box3d only reports them
 	// above the world's hit-event speed threshold (default 1 m/s).
 	shape_def.enableHitEvents = true;
+	shape_def.enableCustomFiltering = custom_filtering;
 
 	switch (shape_type) {
 		case SPHERE: {
@@ -438,6 +440,7 @@ void Box3DBody::create_child_shape(Box3DCollisionShape *p_shape, const Transform
 	sd.isSensor = is_sensor;
 	sd.enableSensorEvents = true;
 	sd.enableHitEvents = true;
+	sd.enableCustomFiltering = custom_filtering;
 	CharString shape_name_utf8 = p_shape->get_shape_name().utf8();
 	sd.name = p_shape->get_shape_name().is_empty() ? nullptr : shape_name_utf8.get_data();
 
@@ -985,6 +988,22 @@ void Box3DBody::set_contact_recycling(bool p_enabled) {
 
 bool Box3DBody::get_contact_recycling() const {
 	return contact_recycling;
+}
+
+// --- Extended core access III: custom filtering ------------------------------
+// Opt this body's shapes into Box3DWorld's pair/layer collision rules
+// (b3ShapeDef.enableCustomFiltering). Off by default: the filter callback then
+// costs nothing for this body. Shape-def flag, so changing it rebuilds.
+void Box3DBody::set_custom_filtering(bool p_enabled) {
+	if (custom_filtering == p_enabled) {
+		return;
+	}
+	custom_filtering = p_enabled;
+	rebuild_if_alive();
+}
+
+bool Box3DBody::get_custom_filtering() const {
+	return custom_filtering;
 }
 
 void Box3DBody::set_sync_node_transform(bool p_enabled) {
@@ -2002,6 +2021,7 @@ bool Box3DBody::create_baked_compound(const Transform3D &p_body_inv) {
 	sd.filter.maskBits = collision_mask;
 	sd.enableSensorEvents = true;
 	sd.enableHitEvents = true;
+	sd.enableCustomFiltering = custom_filtering;
 	b3ShapeId shape = b3CreateBakedCompoundShape(body_id, &sd, compound_data);
 	if (B3_IS_NULL(shape)) {
 		b3DestroyCompound(compound_data);
@@ -2149,6 +2169,8 @@ Array Box3DBody::get_joints() const {
 		Dictionary d;
 		d["joint_id"] = (int64_t)b3StoreJointId(j);
 		d["type"] = (int)b3Joint_GetType(j);
+		// The Box3DJoint node (null for joints not created by a node).
+		d["joint"] = Box3DJoint::from_joint_id(j);
 		b3BodyId a = b3Joint_GetBodyA(j);
 		b3BodyId b = b3Joint_GetBodyB(j);
 		d["body_a"] = b3Body_IsValid(a) ? static_cast<Box3DBody *>(b3Body_GetUserData(a)) : nullptr;
@@ -2755,6 +2777,9 @@ void Box3DBody::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "debug_visualize"), "set_debug_visualize", "get_debug_visualize");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "continuous"), "set_continuous", "get_continuous");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "contact_recycling"), "set_contact_recycling", "get_contact_recycling");
+	ClassDB::bind_method(D_METHOD("set_custom_filtering", "enabled"), &Box3DBody::set_custom_filtering);
+	ClassDB::bind_method(D_METHOD("get_custom_filtering"), &Box3DBody::get_custom_filtering);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "custom_filtering"), "set_custom_filtering", "get_custom_filtering");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "sync_node_transform"), "set_sync_node_transform", "get_sync_node_transform");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "allow_fast_rotation"), "set_allow_fast_rotation", "get_allow_fast_rotation");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "collision_layer", PROPERTY_HINT_LAYERS_3D_PHYSICS), "set_collision_layer", "get_collision_layer");
